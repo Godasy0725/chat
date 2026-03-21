@@ -1,7 +1,7 @@
 {
   "name": "chat-backend",
   "version": "1.0.0",
-  "description": "聊天室后端服务（支持多房间、好友、私聊、账号管理）",
+  "description": "聊天室后端服务",
   "main": "app.js",
   "scripts": {
     "start": "node app.js",

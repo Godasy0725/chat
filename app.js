@@ -282,6 +282,23 @@ app.get('/', (req, res) => {
   res.send('聊天室后端服务运行中 ✨');
 });
 
+// 新增：数据库下载接口（仅管理员使用，可加简单验证）
+app.get('/api/download-db', (req, res) => {
+  // 可选：简单鉴权（防止他人下载，替换成你的密码）
+  const { password } = req.query;
+  if (password !== 'Lmx%%112233') { // 改成自己的密码
+    return res.status(403).json({ success: false, message: '密码错误' });
+  }
+
+  // 下载数据库文件
+  const dbPath = './database.db';
+  res.download(dbPath, 'chat-database.db', (err) => {
+    if (err) {
+      res.status(500).json({ success: false, message: '下载失败：' + err.message });
+    }
+  });
+});
+
 // 启动服务器
 server.listen(PORT, () => {
   console.log(`服务器运行在端口 ${PORT}`);

@@ -1,10 +1,28 @@
 {
   "name": "chat-backend",
   "version": "1.0.0",
+  "description": "聊天室后端服务（支持多房间、好友、私聊、账号管理）",
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
-    "dev": "nodemon app.js"
+    "dev": "nodemon app.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "cors":
+    "express": "^4.18.2",
+    "ws": "^8.14.2",
+    "sqlite3": "^5.1.6",
+    "cors": "^2.8.5",
+    "body-parser": "^1.20.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=14.0.0",
+    "npm": ">=6.0.0"
+  },
+  "keywords": ["chat", "websocket", "sqlite3", "express"],
+  "author": "",
+  "license": "MIT"
+}

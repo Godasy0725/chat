@@ -186,3 +186,15 @@ app.get('/', (req, res) => res.send('running'));
 server.listen(PORT, () => {
   console.log(`Server on ${PORT}`);
 });
+
+// 获取历史消息接口（无需修改，已包含时间）
+app.get('/api/history', (req, res) => {
+  db.all(`SELECT user_id, username, content,
+          datetime(created_at, '+8 hours') as created_at  // 已转换为北京时间
+          FROM messages
+          ORDER BY id ASC
+          LIMIT 500`, (err, rows) => {
+    if (err) return res.status(500).json({ success: false });
+    res.json({ success: true, list: rows });
+  });
+});

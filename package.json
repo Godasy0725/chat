@@ -1,13 +1,13 @@
 {
-  "name": "chat-backend",
-  "version": "1.0.0",
+  "name": "chat",
   "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
   "dependencies": {
+    "cors": "^2.8.5",
     "express": "^4.18.2",
     "sqlite3": "^5.1.6",
     "ws": "^8.14.2"
-  },
-  "scripts": {
-    "start": "node app.js"
   }
 }

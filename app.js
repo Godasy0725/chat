@@ -4,15 +4,17 @@ const WebSocket = require('ws');
 const sqlite3 = require('sqlite3').verbose();
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const crypto = require('crypto');
 
+// 初始化Express应用
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+// 配置
 const PORT = process.env.PORT || 3000;
 const FRONTEND_DOMAIN = 'https://lmx.is-best.net';
 
+// 中间件
 app.use(cors({
   origin: FRONTEND_DOMAIN,
   credentials: true
@@ -20,118 +22,116 @@ app.use(cors({
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// 初始化数据库
+// 初始化SQLite数据库
 const db = new sqlite3.Database('./database.db', (err) => {
   if (err) {
     console.error('数据库连接失败:', err.message);
   } else {
     console.log('成功连接到SQLite数据库');
-    
-    // 用户表
+    // 创建用户表
     db.run(`CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      username TEXT NOT NULL UNIQUE,
+      username TEXT PRIMARY KEY,
       password TEXT NOT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+    )`, (err) => {
+      if (err) console.error('创建用户表失败:', err.message);
+    });
 
-    // 消息表
+    // 创建群聊消息表
     db.run(`CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT NOT NULL,
       username TEXT NOT NULL,
       content TEXT NOT NULL,
       room TEXT NOT NULL DEFAULT '喵喵粉丝群',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+    )`, (err) => {
+      if (err) console.error('创建消息表失败:', err.message);
+    });
 
-    // 好友申请表
-    db.run(`CREATE TABLE IF NOT EXISTS friend_requests (
+    // 创建私聊消息表
+    db.run(`CREATE TABLE IF NOT EXISTS private_messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      from_user_id TEXT NOT NULL,
-      from_username TEXT NOT NULL,
-      to_user_id TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
+      sender TEXT NOT NULL,
+      receiver TEXT NOT NULL,
+      content TEXT NOT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+    )`, (err) => {
+      if (err) console.error('创建私聊消息表失败:', err.message);
+    });
 
-    // 好友关系表
-    db.run(`CREATE TABLE IF NOT EXISTS friendships (
+    // 创建好友申请表
+    db.run(`CREATE TABLE IF NOT EXISTS friend_applies (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT NOT NULL,
-      friend_id TEXT NOT NULL,
-      friend_username TEXT NOT NULL,
+      from_user TEXT NOT NULL,
+      to_user TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(user_id, friend_id)
-    )`);
+      UNIQUE(from_user, to_user)
+    )`, (err) => {
+      if (err) console.error('创建好友申请表失败:', err.message);
+    });
+
+    // 创建好友关系表
+    db.run(`CREATE TABLE IF NOT EXISTS friends (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user1 TEXT NOT NULL,
+      user2 TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user1, user2)
+    )`, (err) => {
+      if (err) console.error('创建好友关系表失败:', err.message);
+    });
   }
 });
-
-// 生成唯一用户ID
-function generateUniqueUserId() {
-  return new Promise((resolve, reject) => {
-    const generateId = () => {
-      const id = crypto.randomBytes(4).toString('hex').toUpperCase();
-      db.get('SELECT id FROM users WHERE id = ?', [id], (err, row) => {
-        if (err) reject(err);
-        else if (row) generateId();
-        else resolve(id);
-      });
-    };
-    generateId();
-  });
-}
 
 // 1. 注册接口
-app.post('/api/register', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    if (!username || !password) {
-      return res.status(400).json({ success: false, message: '用户名和密码不能为空' });
-    }
-
-    const existingUser = await new Promise((resolve) => {
-      db.get('SELECT username FROM users WHERE username = ?', [username], (err, row) => {
-        resolve(row);
-      });
-    });
-
-    if (existingUser) {
-      return res.status(400).json({ success: false, message: '用户名已存在' });
-    }
-
-    const userId = await generateUniqueUserId();
-
-    await new Promise((resolve, reject) => {
-      db.run('INSERT INTO users (id, username, password) VALUES (?, ?, ?)', 
-        [userId, username, password], 
-        (err) => {
-          if (err) reject(err);
-          else resolve();
-        }
-      );
-    });
-
-    res.status(200).json({
-      success: true,
-      message: '注册成功',
-      data: { userId, username }
-    });
-  } catch (error) {
-    console.error('注册失败:', error);
-    res.status(500).json({ success: false, message: '服务器内部错误' });
-  }
-});
-
-// 2. 登录接口
-app.post('/api/login', (req, res) => {
+app.post('/api/register', (req, res) => {
   const { username, password } = req.body;
-
+  
+  // 验证参数
   if (!username || !password) {
     return res.status(400).json({ success: false, message: '用户名和密码不能为空' });
   }
 
-  db.get('SELECT id, username FROM users WHERE username = ? AND password = ?', 
+  // 检查用户名是否已存在
+  db.get('SELECT username FROM users WHERE username = ?', [username], (err, row) => {
+    if (err) {
+      console.error('注册失败:', err);
+      return res.status(500).json({ success: false, message: '服务器内部错误' });
+    }
+    if (row) {
+      return res.status(400).json({ success: false, message: '用户名已存在' });
+    }
+
+    // 插入新用户
+    db.run('INSERT INTO users (username, password) VALUES (?, ?)', 
+      [username, password], 
+      (err) => {
+        if (err) {
+          console.error('插入用户失败:', err);
+          return res.status(500).json({ success: false, message: '服务器内部错误' });
+        }
+        res.status(200).json({
+          success: true,
+          message: '注册成功',
+          data: { username }
+        });
+      }
+    );
+  });
+});
+
+// 2. 登录接口（单账号唯一登录）
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body;
+
+  // 验证参数
+  if (!username || !password) {
+    return res.status(400).json({ success: false, message: '用户名和密码不能为空' });
+  }
+
+  // 验证用户
+  db.get('SELECT username FROM users WHERE username = ? AND password = ?', 
     [username, password], 
     (err, row) => {
       if (err) {
@@ -142,8 +142,9 @@ app.post('/api/login', (req, res) => {
         return res.status(401).json({ success: false, message: '用户名或密码错误' });
       }
 
-      if (userMap.has(row.id)) {
-        const oldWs = userMap.get(row.id);
+      // 顶掉旧连接（单账号唯一登录）
+      if (userMap.has(username)) {
+        const oldWs = userMap.get(username);
         oldWs.send(JSON.stringify({ 
           type: 'kick', 
           reason: '你的账号在其他设备登录' 
@@ -151,20 +152,280 @@ app.post('/api/login', (req, res) => {
         oldWs.close(4001, 'replaced');
       }
 
+      // 登录成功
       res.status(200).json({
         success: true,
         message: '登录成功',
-        data: { userId: row.id, username: row.username }
+        data: { username }
       });
     }
   );
 });
 
-// 3. 获取群聊历史消息
+// 3. 修改昵称接口
+app.post('/api/rename', (req, res) => {
+  const { oldName, newName } = req.body;
+
+  if (!oldName || !newName || oldName === newName) {
+    return res.status(400).json({ success: false, message: '参数错误' });
+  }
+
+  // 检查新昵称是否已存在
+  db.get('SELECT username FROM users WHERE username = ?', [newName], (err, row) => {
+    if (err) {
+      return res.status(500).json({ success: false, message: '服务器内部错误' });
+    }
+    if (row) {
+      return res.status(400).json({ success: false, message: '新昵称已被使用' });
+    }
+
+    // 事务：更新所有相关表
+    db.serialize(() => {
+      db.run('BEGIN TRANSACTION');
+      
+      // 更新用户表
+      db.run('UPDATE users SET username = ? WHERE username = ?', [newName, oldName]);
+      // 更新群聊消息表
+      db.run('UPDATE messages SET username = ? WHERE username = ?', [newName, oldName]);
+      // 更新私聊消息表（发送者）
+      db.run('UPDATE private_messages SET sender = ? WHERE sender = ?', [newName, oldName]);
+      // 更新私聊消息表（接收者）
+      db.run('UPDATE private_messages SET receiver = ? WHERE receiver = ?', [newName, oldName]);
+      // 更新好友申请表（发起者）
+      db.run('UPDATE friend_applies SET from_user = ? WHERE from_user = ?', [newName, oldName]);
+      // 更新好友申请表（接收者）
+      db.run('UPDATE friend_applies SET to_user = ? WHERE to_user = ?', [newName, oldName]);
+      // 更新好友关系表
+      db.run('UPDATE friends SET user1 = ? WHERE user1 = ?', [newName, oldName]);
+      db.run('UPDATE friends SET user2 = ? WHERE user2 = ?', [newName, oldName]);
+      
+      db.run('COMMIT', (err) => {
+        if (err) {
+          db.run('ROLLBACK');
+          return res.status(500).json({ success: false, message: '修改失败' });
+        }
+        
+        // 更新在线用户映射
+        if (userMap.has(oldName)) {
+          const ws = userMap.get(oldName);
+          userMap.delete(oldName);
+          userMap.set(newName, ws);
+          wsToUser.set(ws, { username: newName, room: wsToUser.get(ws).room });
+        }
+        
+        res.json({ success: true, message: '昵称修改成功' });
+      });
+    });
+  });
+});
+
+// 4. 注销账号接口
+app.post('/api/delete-account', (req, res) => {
+  const { username } = req.body;
+
+  if (!username) {
+    return res.status(400).json({ success: false, message: '参数错误' });
+  }
+
+  // 顶掉连接
+  if (userMap.has(username)) {
+    const oldWs = userMap.get(username);
+    oldWs.close();
+    userMap.delete(username);
+  }
+
+  // 事务：删除所有相关数据
+  db.serialize(() => {
+    db.run('BEGIN TRANSACTION');
+    
+    db.run('DELETE FROM users WHERE username = ?', [username]);
+    db.run('DELETE FROM messages WHERE username = ?', [username]);
+    db.run('DELETE FROM private_messages WHERE sender = ? OR receiver = ?', [username, username]);
+    db.run('DELETE FROM friend_applies WHERE from_user = ? OR to_user = ?', [username, username]);
+    db.run('DELETE FROM friends WHERE user1 = ? OR user2 = ?', [username, username]);
+    
+    db.run('COMMIT', (err) => {
+      if (err) {
+        db.run('ROLLBACK');
+        return res.status(500).json({ success: false, message: '注销失败' });
+      }
+      res.json({ success: true, message: '账号注销成功' });
+    });
+  });
+});
+
+// 5. 添加好友接口
+app.post('/api/add-friend', (req, res) => {
+  const { from, to } = req.body;
+
+  if (!from || !to || from === to) {
+    return res.status(400).json({ success: false, message: '参数错误' });
+  }
+
+  // 检查对方是否存在
+  db.get('SELECT username FROM users WHERE username = ?', [to], (err, row) => {
+    if (err) {
+      return res.status(500).json({ success: false, message: '服务器内部错误' });
+    }
+    if (!row) {
+      return res.status(400).json({ success: false, message: '用户不存在' });
+    }
+
+    // 检查是否已发送申请
+    db.get('SELECT id FROM friend_applies WHERE from_user = ? AND to_user = ?', [from, to], (err, row) => {
+      if (err) {
+        return res.status(500).json({ success: false, message: '服务器内部错误' });
+      }
+      if (row) {
+        return res.status(400).json({ success: false, message: '已发送好友申请' });
+      }
+
+      // 检查是否已是好友
+      db.get(`SELECT id FROM friends WHERE (user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)`, 
+        [from, to, to, from], (err, row) => {
+          if (err) {
+            return res.status(500).json({ success: false, message: '服务器内部错误' });
+          }
+          if (row) {
+            return res.status(400).json({ success: false, message: '已是好友' });
+          }
+
+          // 插入申请
+          db.run('INSERT INTO friend_applies (from_user, to_user) VALUES (?, ?)', [from, to], (err) => {
+            if (err) {
+              return res.status(500).json({ success: false, message: '发送申请失败' });
+            }
+
+            // 通知对方
+            if (userMap.has(to)) {
+              const ws = userMap.get(to);
+              ws.send(JSON.stringify({
+                type: 'friend_apply',
+                from: from
+              }));
+            }
+
+            res.json({ success: true, message: '好友申请发送成功' });
+          });
+        }
+      );
+    });
+  });
+});
+
+// 6. 同意好友申请
+app.post('/api/agree-friend', (req, res) => {
+  const { from, to } = req.body;
+
+  if (!from || !to) {
+    return res.status(400).json({ success: false, message: '参数错误' });
+  }
+
+  // 事务：更新申请状态 + 添加好友关系
+  db.serialize(() => {
+    db.run('BEGIN TRANSACTION');
+    
+    // 更新申请状态
+    db.run('UPDATE friend_applies SET status = ? WHERE from_user = ? AND to_user = ?', ['agreed', from, to]);
+    // 添加好友关系
+    db.run('INSERT INTO friends (user1, user2) VALUES (?, ?)', [from, to]);
+    
+    db.run('COMMIT', (err) => {
+      if (err) {
+        db.run('ROLLBACK');
+        return res.status(500).json({ success: false, message: '同意失败' });
+      }
+      res.json({ success: true, message: '已同意好友申请' });
+    });
+  });
+});
+
+// 7. 拒绝好友申请
+app.post('/api/reject-friend', (req, res) => {
+  const { from, to } = req.body;
+
+  if (!from || !to) {
+    return res.status(400).json({ success: false, message: '参数错误' });
+  }
+
+  db.run('UPDATE friend_applies SET status = ? WHERE from_user = ? AND to_user = ?', 
+    ['rejected', from, to], (err) => {
+      if (err) {
+        return res.status(500).json({ success: false, message: '拒绝失败' });
+      }
+      res.json({ success: true, message: '已拒绝好友申请' });
+    }
+  );
+});
+
+// 8. 删除好友
+app.post('/api/delete-friend', (req, res) => {
+  const { user, friend } = req.body;
+
+  if (!user || !friend) {
+    return res.status(400).json({ success: false, message: '参数错误' });
+  }
+
+  db.run(`DELETE FROM friends WHERE (user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)`, 
+    [user, friend, friend, user], (err) => {
+      if (err) {
+        return res.status(500).json({ success: false, message: '删除失败' });
+      }
+      res.json({ success: true, message: '好友删除成功' });
+    }
+  );
+});
+
+// 9. 获取好友申请列表
+app.get('/api/friend-apply', (req, res) => {
+  const { username } = req.query;
+
+  if (!username) {
+    return res.status(400).json({ success: false, message: '参数错误' });
+  }
+
+  db.all('SELECT from_user FROM friend_applies WHERE to_user = ? AND status = ?', 
+    [username, 'pending'], (err, rows) => {
+      if (err) {
+        return res.status(500).json({ success: false, message: '获取失败' });
+      }
+      res.json({ 
+        success: true, 
+        list: rows.map(row => ({ from: row.from_user })) 
+      });
+    }
+  );
+});
+
+// 10. 获取好友列表
+app.get('/api/friend-list', (req, res) => {
+  const { username } = req.query;
+
+  if (!username) {
+    return res.status(400).json({ success: false, message: '参数错误' });
+  }
+
+  db.all(`SELECT 
+          CASE WHEN user1 = ? THEN user2 ELSE user1 END as friend 
+          FROM friends 
+          WHERE user1 = ? OR user2 = ?`, 
+    [username, username, username], (err, rows) => {
+      if (err) {
+        return res.status(500).json({ success: false, message: '获取失败' });
+      }
+      res.json({ 
+        success: true, 
+        list: rows.map(row => row.friend) 
+      });
+    }
+  );
+});
+
+// 11. 获取群聊历史消息
 app.get('/api/history', (req, res) => {
   const { room = '喵喵粉丝群' } = req.query;
   
-  db.all(`SELECT user_id, username, content,
+  db.all(`SELECT username, content,
           datetime(created_at, '+8 hours') as created_at
           FROM messages
           WHERE room = ?
@@ -178,297 +439,123 @@ app.get('/api/history', (req, res) => {
   });
 });
 
-// 4. 修改昵称接口
-app.post('/api/rename', (req, res) => {
-  const { userId, newName } = req.body;
-  
-  if (!userId || !newName) {
-    return res.status(400).json({ success: false, message: '参数不能为空' });
+// 12. 获取私聊历史消息
+app.get('/api/private-history', (req, res) => {
+  const { user, friend } = req.query;
+
+  if (!user || !friend) {
+    return res.status(400).json({ success: false, message: '参数错误' });
   }
 
-  // 检查新昵称是否已存在
-  db.get('SELECT id FROM users WHERE username = ? AND id != ?', [newName, userId], (err, row) => {
+  db.all(`SELECT sender, content,
+          datetime(created_at, '+8 hours') as created_at
+          FROM private_messages
+          WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)
+          ORDER BY id ASC
+          LIMIT 500`, [user, friend, friend, user], (err, rows) => {
     if (err) {
-      return res.status(500).json({ success: false, message: '服务器错误' });
-    }
-    if (row) {
-      return res.status(400).json({ success: false, message: '昵称已被使用' });
-    }
-
-    // 更新用户名
-    db.run('UPDATE users SET username = ? WHERE id = ?', [newName, userId], (err) => {
-      if (err) {
-        return res.status(500).json({ success: false, message: '修改失败' });
-      }
-
-      // 更新好友关系中的昵称
-      db.run('UPDATE friendships SET friend_username = ? WHERE friend_id = ?', [newName, userId]);
-      db.run('UPDATE friend_requests SET from_username = ? WHERE from_user_id = ?', [newName, userId]);
-
-      res.json({ success: true, message: '昵称修改成功' });
-    });
-  });
-});
-
-// 5. 注销账号接口
-app.post('/api/delete-account', (req, res) => {
-  const { userId } = req.body;
-  
-  if (!userId) {
-    return res.status(400).json({ success: false, message: '参数不能为空' });
-  }
-
-  // 开启事务删除所有相关数据
-  db.serialize(() => {
-    db.run('BEGIN TRANSACTION');
-    
-    // 删除用户消息
-    db.run('DELETE FROM messages WHERE user_id = ?', [userId]);
-    // 删除好友申请
-    db.run('DELETE FROM friend_requests WHERE from_user_id = ? OR to_user_id = ?', [userId, userId]);
-    // 删除好友关系
-    db.run('DELETE FROM friendships WHERE user_id = ? OR friend_id = ?', [userId, userId]);
-    // 删除用户
-    db.run('DELETE FROM users WHERE id = ?', [userId], (err) => {
-      if (err) {
-        db.run('ROLLBACK');
-        return res.status(500).json({ success: false, message: '注销失败' });
-      }
-      db.run('COMMIT');
-      res.json({ success: true, message: '账号注销成功' });
-    });
-  });
-});
-
-// 6. 发送好友申请
-app.post('/api/add-friend', (req, res) => {
-  const { userId, friendId } = req.body;
-  
-  if (!userId || !friendId) {
-    return res.status(400).json({ success: false, message: '参数不能为空' });
-  }
-
-  // 检查好友ID是否存在
-  db.get('SELECT id, username FROM users WHERE id = ?', [friendId], (err, friend) => {
-    if (err || !friend) {
-      return res.status(400).json({ success: false, message: '好友ID不存在' });
-    }
-
-    // 检查是否已是好友
-    db.get('SELECT id FROM friendships WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)', 
-      [userId, friendId, friendId, userId], (err, row) => {
-        if (row) {
-          return res.status(400).json({ success: false, message: '已是好友' });
-        }
-
-        // 检查是否已发送申请
-        db.get('SELECT id FROM friend_requests WHERE from_user_id = ? AND to_user_id = ? AND status = ?', 
-          [userId, friendId, 'pending'], (err, row) => {
-            if (row) {
-              return res.status(400).json({ success: false, message: '已发送好友申请' });
-            }
-
-            // 获取当前用户信息
-            db.get('SELECT username FROM users WHERE id = ?', [userId], (err, user) => {
-              if (err || !user) {
-                return res.status(500).json({ success: false, message: '获取用户信息失败' });
-              }
-
-              // 插入好友申请
-              db.run('INSERT INTO friend_requests (from_user_id, from_username, to_user_id) VALUES (?, ?, ?)', 
-                [userId, user.username, friendId], (err) => {
-                  if (err) {
-                    return res.status(500).json({ success: false, message: '发送申请失败' });
-                  }
-
-                  // 通知对方有好友申请
-                  notifyFriendRequest(friendId, userId, user.username);
-
-                  res.json({ success: true, message: '好友申请已发送' });
-                }
-              );
-            });
-          }
-        );
-      }
-    );
-  });
-});
-
-// 7. 获取好友申请列表
-app.get('/api/friend-requests', (req, res) => {
-  const { userId } = req.query;
-  
-  if (!userId) {
-    return res.status(400).json({ success: false, message: '参数不能为空' });
-  }
-
-  db.all('SELECT * FROM friend_requests WHERE to_user_id = ? AND status = ?', 
-    [userId, 'pending'], (err, rows) => {
-      if (err) {
-        return res.status(500).json({ success: false, message: '获取申请列表失败' });
-      }
-      res.json({ success: true, list: rows });
-    }
-  );
-});
-
-// 8. 同意好友申请
-app.post('/api/accept-friend', (req, res) => {
-  const { requestId } = req.body;
-  
-  if (!requestId) {
-    return res.status(400).json({ success: false, message: '参数不能为空' });
-  }
-
-  // 获取申请信息
-  db.get('SELECT * FROM friend_requests WHERE id = ?', [requestId], (err, req) => {
-    if (err || !req) {
-      return res.status(400).json({ success: false, message: '申请不存在' });
-    }
-
-    // 更新申请状态
-    db.run('UPDATE friend_requests SET status = ? WHERE id = ?', ['accepted', requestId], (err) => {
-      if (err) {
-        return res.status(500).json({ success: false, message: '同意申请失败' });
-      }
-
-      // 获取双方用户名
-      db.get('SELECT username FROM users WHERE id = ?', [req.from_user_id], (err, fromUser) => {
-        db.get('SELECT username FROM users WHERE id = ?', [req.to_user_id], (err, toUser) => {
-          // 建立双向好友关系
-          db.run('INSERT OR IGNORE INTO friendships (user_id, friend_id, friend_username) VALUES (?, ?, ?)', 
-            [req.from_user_id, req.to_user_id, toUser.username]);
-          db.run('INSERT OR IGNORE INTO friendships (user_id, friend_id, friend_username) VALUES (?, ?, ?)', 
-            [req.to_user_id, req.from_user_id, fromUser.username], (err) => {
-              if (err) {
-                return res.status(500).json({ success: false, message: '建立好友关系失败' });
-              }
-              res.json({ success: true, message: '已同意好友申请' });
-            }
-          );
-        });
-      });
-    });
-  });
-});
-
-// 9. 拒绝好友申请
-app.post('/api/reject-friend', (req, res) => {
-  const { requestId } = req.body;
-  
-  if (!requestId) {
-    return res.status(400).json({ success: false, message: '参数不能为空' });
-  }
-
-  db.run('UPDATE friend_requests SET status = ? WHERE id = ?', ['rejected', requestId], (err) => {
-    if (err) {
-      return res.status(500).json({ success: false, message: '拒绝申请失败' });
-    }
-    res.json({ success: true, message: '已拒绝好友申请' });
-  });
-});
-
-// 10. 获取好友列表
-app.get('/api/friends', (req, res) => {
-  const { userId } = req.query;
-  
-  if (!userId) {
-    return res.status(400).json({ success: false, message: '参数不能为空' });
-  }
-
-  db.all('SELECT * FROM friendships WHERE user_id = ?', [userId], (err, rows) => {
-    if (err) {
-      return res.status(500).json({ success: false, message: '获取好友列表失败' });
+      return res.status(500).json({ success: false, message: '获取私聊记录失败' });
     }
     res.json({ success: true, list: rows });
   });
 });
 
-// 11. 删除好友
-app.post('/api/delete-friend', (req, res) => {
-  const { friendshipId } = req.body;
-  
-  if (!friendshipId) {
-    return res.status(400).json({ success: false, message: '参数不能为空' });
+// 13. 发送私聊消息
+app.post('/api/send-private', (req, res) => {
+  const { sender, receiver, content } = req.body;
+
+  if (!sender || !receiver || !content) {
+    return res.status(400).json({ success: false, message: '参数错误' });
   }
 
-  // 获取好友关系信息
-  db.get('SELECT user_id, friend_id FROM friendships WHERE id = ?', [friendshipId], (err, fs) => {
-    if (err || !fs) {
-      return res.status(400).json({ success: false, message: '好友关系不存在' });
-    }
-
-    // 删除双向好友关系
-    db.run('DELETE FROM friendships WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)', 
-      [fs.user_id, fs.friend_id, fs.friend_id, fs.user_id], (err) => {
-        if (err) {
-          return res.status(500).json({ success: false, message: '删除好友失败' });
-        }
-        res.json({ success: true, message: '已删除好友' });
+  // 检查是否是好友
+  db.get(`SELECT id FROM friends WHERE (user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)`, 
+    [sender, receiver, receiver, sender], (err, row) => {
+      if (err) {
+        return res.status(500).json({ success: false, message: '服务器内部错误' });
       }
-    );
-  });
+      if (!row) {
+        return res.status(400).json({ success: false, message: '非好友无法私聊' });
+      }
+
+      // 保存私聊消息
+      db.run('INSERT INTO private_messages (sender, receiver, content) VALUES (?, ?, ?)', 
+        [sender, receiver, content], (err) => {
+          if (err) {
+            return res.status(500).json({ success: false, message: '发送失败' });
+          }
+
+          // 通知对方
+          if (userMap.has(receiver)) {
+            const ws = userMap.get(receiver);
+            ws.send(JSON.stringify({
+              type: 'private_msg',
+              sender: sender,
+              content: content
+            }));
+          }
+
+          res.json({ success: true, message: '发送成功' });
+        }
+      );
+    }
+  );
 });
 
-// 在线用户映射
+// 在线用户映射：username => ws
 const userMap = new Map();
+// ws => { username, room }
 const wsToUser = new WeakMap();
 
-// 通知好友申请
-function notifyFriendRequest(toUserId, fromUserId, fromUsername) {
-  // 查找对方的WebSocket连接
-  if (userMap.has(toUserId)) {
-    const ws = userMap.get(toUserId);
-    ws.send(JSON.stringify({
-      type: 'friend_request',
-      fromUserId,
-      fromUsername
-    }));
-  }
-}
-
-// WebSocket处理
+// WebSocket 处理
 wss.on('connection', (ws) => {
   console.log('新的WebSocket连接');
 
+  // 接收客户端消息
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message);
       
+      // 客户端登录WebSocket
       if (data.type === 'login') {
-        const { userId, username, room = '喵喵粉丝群' } = data;
-        if (userId && username) {
-          if (userMap.has(userId)) {
-            const oldWs = userMap.get(userId);
+        const { username, room = '喵喵粉丝群' } = data;
+        if (username) {
+          // 单处登录：踢旧
+          if (userMap.has(username)) {
+            const oldWs = userMap.get(username);
             oldWs.send(JSON.stringify({ type: 'kick', reason: '你的账号在别处登录' }));
             oldWs.close(4001, 'replaced');
           }
 
-          userMap.set(userId, ws);
-          wsToUser.set(ws, { userId, username, room });
+          // 绑定用户和房间
+          userMap.set(username, ws);
+          wsToUser.set(ws, { username, room });
 
+          // 广播用户上线（仅同房间）
           broadcast({
             type: 'system',
-            content: `${username} (ID: ${userId}) 加入了聊天室`,
+            content: `${username} 加入了聊天室`,
             room: room
           });
+          console.log(`${username} 进入房间 ${room}`);
         }
       }
 
+      // 客户端发送群聊消息
       if (data.type === 'chat' && wsToUser.has(ws)) {
         const userInfo = wsToUser.get(ws);
-        const { userId, username } = userInfo;
+        const { username } = userInfo;
         const { content, room = '喵喵粉丝群' } = data;
 
-        db.run('INSERT INTO messages (user_id, username, content, room) VALUES (?, ?, ?, ?)',
-          [userId, username, content, room], (err) => {
+        // 保存消息到数据库
+        db.run('INSERT INTO messages (username, content, room) VALUES (?, ?, ?)',
+          [username, content, room], (err) => {
             if (err) console.error('保存消息失败:', err);
           });
 
+        // 广播消息给同房间所有用户
         broadcast({
           type: 'chat',
-          userId,
           username,
           content,
           room
@@ -479,26 +566,31 @@ wss.on('connection', (ws) => {
     }
   });
 
+  // 连接关闭
   ws.on('close', () => {
     if (wsToUser.has(ws)) {
-      const { userId, username, room } = wsToUser.get(ws);
-      userMap.delete(userId);
+      const { username, room } = wsToUser.get(ws);
+      // 移除映射
+      userMap.delete(username);
       wsToUser.delete(ws);
+      // 广播用户下线
       broadcast({
         type: 'system',
-        content: `${username} (ID: ${userId}) 离开了聊天室`,
+        content: `${username} 离开了聊天室`,
         room: room
       });
+      console.log(`${username} 离开房间 ${room}`);
     }
     console.log('WebSocket连接关闭');
   });
 
+  // 错误处理
   ws.on('error', (error) => {
     console.error('WebSocket错误:', error);
   });
 });
 
-// 广播消息
+// 广播消息（仅发送给同房间的在线用户）
 function broadcast(message) {
   wss.clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
@@ -510,7 +602,7 @@ function broadcast(message) {
   });
 }
 
-// 健康检查
+// 健康检查接口
 app.get('/', (req, res) => {
   res.send('聊天室后端服务运行中 ✨');
 });

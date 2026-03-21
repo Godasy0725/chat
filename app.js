@@ -299,6 +299,99 @@ app.get('/api/download-db', (req, res) => {
   });
 });
 
+// 改名接口
+app.post('/api/rename', (req, res) => {
+  const { userId, newName } = req.body;
+  if (!userId || !newName) {
+    return res.status(400).json({ success: false, message: '参数不能为空' });
+  }
+  
+  db.run('UPDATE users SET username = ? WHERE id = ?', [newName, userId], (err) => {
+    if (err) {
+      console.error('修改昵称失败:', err);
+      return res.status(500).json({ success: false, message: '修改失败' });
+    }
+    res.json({ success: true, message: '昵称修改成功' });
+  });
+});
+
+// 注销账号接口
+app.post('/api/delete-account', (req, res) => {
+  const { userId } = req.body;
+  if (!userId) {
+    return res.status(400).json({ success: false, message: '参数不能为空' });
+  }
+  
+  // 开启事务
+  db.run('BEGIN TRANSACTION', (err) => {
+    if (err) return res.status(500).json({ success: false });
+    
+    // 删除用户消息
+    db.run('DELETE FROM messages WHERE user_id = ?', [userId], (err) => {
+      if (err) {
+        db.run('ROLLBACK');
+        return res.status(500).json({ success: false });
+      }
+      
+      // 删除用户
+      db.run('DELETE FROM users WHERE id = ?', [userId], (err) => {
+        if (err) {
+          db.run('ROLLBACK');
+          return res.status(500).json({ success: false });
+        }
+        
+        db.run('COMMIT', () => {
+          res.json({ success: true, message: '账号注销成功' });
+        });
+      });
+    });
+  });
+});
+
+// 好友相关表（初始化）
+db.run(`CREATE TABLE IF NOT EXISTS friends (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  friend_id TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, friend_id)
+)`);
+
+// 好友申请接口
+app.post('/api/add-friend', (req, res) => {
+  const { userId, friendId } = req.body;
+  if (!userId || !friendId) {
+    return res.status(400).json({ success: false, message: '参数不能为空' });
+  }
+  
+  db.run('INSERT INTO friends (user_id, friend_id) VALUES (?, ?)', [userId, friendId], (err) => {
+    if (err) {
+      console.error('添加好友失败:', err);
+      return res.status(500).json({ success: false, message: '添加失败' });
+    }
+    res.json({ success: true, message: '好友添加成功' });
+  });
+});
+
+// 获取好友列表接口
+app.get('/api/friends', (req, res) => {
+  const { userId } = req.query;
+  if (!userId) {
+    return res.status(400).json({ success: false, message: '参数不能为空' });
+  }
+  
+  db.all(`SELECT u.id, u.username 
+          FROM friends f
+          JOIN users u ON f.friend_id = u.id
+          WHERE f.user_id = ?`, [userId], (err, rows) => {
+    if (err) {
+      console.error('获取好友列表失败:', err);
+      return res.status(500).json({ success: false });
+    }
+    res.json({ success: true, list: rows });
+  });
+});
+
 // 启动服务器
 server.listen(PORT, () => {
   console.log(`服务器运行在端口 ${PORT}`);

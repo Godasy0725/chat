@@ -13,6 +13,7 @@ const wss = new WebSocket.Server({ server });
 // 配置
 const PORT = process.env.PORT || 3000;
 const FRONTEND_DOMAIN = 'https://lmx.is-best.net';
+const ADMIN_PASSWORD = 'Lmx%%112233';
 
 // 中间件
 app.use(cors({
@@ -80,6 +81,49 @@ const db = new sqlite3.Database('./database.db', (err) => {
       UNIQUE(user1, user2)
     )`, (err) => {
       if (err) console.error('创建好友关系表失败:', err.message);
+    });
+
+    // 创建聊天室表
+    db.run(`CREATE TABLE IF NOT EXISTS rooms (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      creator TEXT NOT NULL,
+      locked INTEGER NOT NULL DEFAULT 0,
+      muted INTEGER NOT NULL DEFAULT 0,
+      visible INTEGER NOT NULL DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`, (err) => {
+      if (err) console.error('创建聊天室表失败:', err.message);
+    });
+
+    // 创建公告表
+    db.run(`CREATE TABLE IF NOT EXISTS announcement (
+      id INTEGER PRIMARY KEY,
+      content TEXT DEFAULT '',
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`, (err) => {
+      if (err) console.error('创建公告表失败:', err.message);
+    });
+
+    // 创建IP禁言表
+    db.run(`CREATE TABLE IF NOT EXISTS muted_ips (
+      ip TEXT PRIMARY KEY,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`, (err) => {
+      if (err) console.error('创建IP禁言表失败:', err.message);
+    });
+
+    // 初始化默认数据
+    db.get('SELECT id FROM rooms WHERE name = ?', ['喵喵粉丝群'], (err, row) => {
+      if (!row) {
+        db.run('INSERT INTO rooms (name, creator, locked, muted, visible) VALUES (?, ?, 0, 0, 1)', 
+          ['喵喵粉丝群', 'system']);
+      }
+    });
+    db.get('SELECT id FROM announcement WHERE id = 1', (err, row) => {
+      if (!row) {
+        db.run('INSERT INTO announcement (id, content) VALUES (1, "")');
+      }
     });
   }
 });
@@ -198,6 +242,8 @@ app.post('/api/rename', (req, res) => {
       // 更新好友关系表
       db.run('UPDATE friends SET user1 = ? WHERE user1 = ?', [newName, oldName]);
       db.run('UPDATE friends SET user2 = ? WHERE user2 = ?', [newName, oldName]);
+      // 更新聊天室创建者
+      db.run('UPDATE rooms SET creator = ? WHERE creator = ?', [newName, oldName]);
       
       db.run('COMMIT', (err) => {
         if (err) {
@@ -210,7 +256,7 @@ app.post('/api/rename', (req, res) => {
           const ws = userMap.get(oldName);
           userMap.delete(oldName);
           userMap.set(newName, ws);
-          wsToUser.set(ws, { username: newName, room: wsToUser.get(ws).room });
+          wsToUser.set(ws, { username: newName, room: wsToUser.get(ws).room, ip: wsToUser.get(ws).ip });
         }
         
         res.json({ success: true, message: '昵称修改成功' });
@@ -243,6 +289,7 @@ app.post('/api/delete-account', (req, res) => {
     db.run('DELETE FROM private_messages WHERE sender = ? OR receiver = ?', [username, username]);
     db.run('DELETE FROM friend_applies WHERE from_user = ? OR to_user = ?', [username, username]);
     db.run('DELETE FROM friends WHERE user1 = ? OR user2 = ?', [username, username]);
+    db.run('DELETE FROM rooms WHERE creator = ?', [username]);
     
     db.run('COMMIT', (err) => {
       if (err) {
@@ -479,14 +526,431 @@ app.post('/api/send-private', (req, res) => {
   );
 });
 
+// 14. 获取聊天室列表（带在线人数）
+app.get('/api/rooms', (req, res) => {
+  db.all('SELECT * FROM rooms WHERE visible = 1', (err, rooms) => {
+    if (err) {
+      return res.status(500).json({ success: false, message: '获取失败' });
+    }
+    
+    // 计算每个房间的在线人数
+    const result = [];
+    let count = 0;
+    
+    rooms.forEach(room => {
+      let onlineCount = 0;
+      // 统计当前房间在线人数
+      wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN && wsToUser.has(client)) {
+          const user = wsToUser.get(client);
+          if (user.room === room.name) {
+            onlineCount++;
+          }
+        }
+      });
+      
+      result.push({
+        id: room.id,
+        name: room.name,
+        creator: room.creator,
+        locked: room.locked,
+        onlineCount
+      });
+      
+      count++;
+      if (count === rooms.length) {
+        res.json({ success: true, rooms: result });
+      }
+    });
+    
+    if (rooms.length === 0) {
+      res.json({ success: true, rooms: [] });
+    }
+  });
+});
+
+// 15. 用户创建聊天室（每个用户只能创建一个）
+app.post('/api/user/create-room', (req, res) => {
+  const { username } = req.body;
+  
+  if (!username) {
+    return res.status(400).json({ success: false, message: '参数错误' });
+  }
+
+  // 检查是否已创建过
+  db.get('SELECT id FROM rooms WHERE creator = ?', [username], (err, row) => {
+    if (err) {
+      return res.status(500).json({ success: false, message: '服务器内部错误' });
+    }
+    if (row) {
+      return res.status(400).json({ success: false, message: '你已经创建过一个聊天室' });
+    }
+
+    // 创建聊天室
+    const roomName = `${username}的专属聊天室`;
+    db.run('INSERT INTO rooms (name, creator, locked, muted, visible) VALUES (?, ?, 0, 0, 1)', 
+      [roomName, username], (err) => {
+        if (err) {
+          return res.status(500).json({ success: false, message: '创建失败' });
+        }
+        res.json({ success: true, message: '聊天室创建成功', data: { roomName } });
+      }
+    );
+  });
+});
+
+// ------------------- 管理员接口 -------------------
+// 16. 管理员仪表盘
+app.get('/api/admin/dashboard', (req, res) => {
+  const online = userMap.size;
+  
+  // 获取今日消息数
+  db.get('SELECT COUNT(*) as count FROM messages WHERE DATE(created_at) = DATE("now", "+8 hours")', (err, msgRow) => {
+    const messages = msgRow?.count || 0;
+    
+    // 获取总用户数
+    db.get('SELECT COUNT(*) as count FROM users', (err, userRow) => {
+      const users = userRow?.count || 0;
+      
+      // 获取聊天室数
+      db.get('SELECT COUNT(*) as count FROM rooms', (err, roomRow) => {
+        const rooms = roomRow?.count || 0;
+        
+        // 获取在线IP列表
+        const ips = [];
+        wss.clients.forEach(client => {
+          if (client.readyState === WebSocket.OPEN && wsToUser.has(client)) {
+            const user = wsToUser.get(client);
+            ips.push({
+              username: user.username,
+              ip: user.ip,
+              room: user.room,
+              muted: false // 简化处理，实际可查muted_ips表
+            });
+          }
+        });
+        
+        res.json({ 
+          success: true, 
+          online, 
+          rooms, 
+          users, 
+          messages, 
+          ips 
+        });
+      });
+    });
+  });
+});
+
+// 17. 管理员获取聊天室列表
+app.get('/api/admin/rooms', (req, res) => {
+  db.all('SELECT * FROM rooms', (err, rooms) => {
+    if (err) {
+      return res.status(500).json({ success: false, message: '获取失败' });
+    }
+    
+    const result = [];
+    let count = 0;
+    
+    rooms.forEach(room => {
+      // 计算成员数
+      let memberCount = 0;
+      wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN && wsToUser.has(client)) {
+          const user = wsToUser.get(client);
+          if (user.room === room.name) {
+            memberCount++;
+          }
+        }
+      });
+      
+      result.push({
+        id: room.id,
+        name: room.name,
+        memberCount,
+        creator: room.creator,
+        muted: room.muted,
+        visible: room.visible,
+        locked: room.locked
+      });
+      
+      count++;
+      if (count === rooms.length) {
+        res.json({ success: true, rooms: result });
+      }
+    });
+    
+    if (rooms.length === 0) {
+      res.json({ success: true, rooms: [] });
+    }
+  });
+});
+
+// 18. 管理员获取用户列表
+app.get('/api/admin/users', (req, res) => {
+  db.all('SELECT username, created_at FROM users', (err, users) => {
+    if (err) {
+      return res.status(500).json({ success: false, message: '获取失败' });
+    }
+    
+    const result = users.map(user => ({
+      username: user.username,
+      createdAt: user.created_at,
+      online: userMap.has(user.username)
+    }));
+    
+    res.json({ success: true, users: result });
+  });
+});
+
+// 19. 管理员获取聊天记录
+app.get('/api/admin/records', (req, res) => {
+  const { room = 'all' } = req.query;
+  
+  let sql = `SELECT m.*, r.name as roomName 
+             FROM messages m 
+             LEFT JOIN rooms r ON m.room = r.name 
+             ORDER BY m.created_at DESC LIMIT 100`;
+             
+  if (room !== 'all') {
+    sql = `SELECT m.*, r.name as roomName 
+           FROM messages m 
+           LEFT JOIN rooms r ON m.room = r.name 
+           WHERE m.room = ? 
+           ORDER BY m.created_at DESC LIMIT 100`;
+  }
+  
+  db.all(sql, room !== 'all' ? [room] : [], (err, records) => {
+    if (err) {
+      return res.status(500).json({ success: false, message: '获取失败' });
+    }
+    
+    const result = records.map(record => ({
+      id: record.id,
+      roomName: record.roomName || record.room,
+      username: record.username,
+      content: record.content,
+      createdAt: record.created_at
+    }));
+    
+    res.json({ success: true, records: result });
+  });
+});
+
+// 20. 管理员获取好友列表
+app.get('/api/admin/friends', (req, res) => {
+  db.all('SELECT * FROM friends', (err, friends) => {
+    if (err) {
+      return res.status(500).json({ success: false, message: '获取失败' });
+    }
+    
+    res.json({ success: true, friends });
+  });
+});
+
+// 21. 管理员获取/保存公告
+app.get('/api/admin/announcement', (req, res) => {
+  db.get('SELECT content FROM announcement WHERE id = 1', (err, row) => {
+    if (err) {
+      return res.status(500).json({ success: false, message: '获取失败' });
+    }
+    res.json({ success: true, content: row?.content || '' });
+  });
+});
+
+app.post('/api/admin/announcement', (req, res) => {
+  const { content } = req.body;
+  
+  db.run('UPDATE announcement SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1', [content], (err) => {
+    if (err) {
+      return res.status(500).json({ success: false, message: '保存失败' });
+    }
+    
+    // 推送公告到所有在线用户
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({
+          type: 'announcement',
+          content
+        }));
+      }
+    });
+    
+    res.json({ success: true, message: '公告保存成功' });
+  });
+});
+
+// 22. 管理员禁言IP
+app.post('/api/admin/mute-ip', (req, res) => {
+  const { ip } = req.body;
+  
+  if (!ip) {
+    return res.status(400).json({ success: false, message: '参数错误' });
+  }
+  
+  // 检查是否已禁言
+  db.get('SELECT ip FROM muted_ips WHERE ip = ?', [ip], (err, row) => {
+    if (err) {
+      return res.status(500).json({ success: false, message: '操作失败' });
+    }
+    
+    if (row) {
+      // 解除禁言
+      db.run('DELETE FROM muted_ips WHERE ip = ?', [ip], (err) => {
+        if (err) {
+          return res.status(500).json({ success: false, message: '操作失败' });
+        }
+        res.json({ success: true, message: '已解除IP禁言' });
+      });
+    } else {
+      // 禁言IP
+      db.run('INSERT INTO muted_ips (ip) VALUES (?)', [ip], (err) => {
+        if (err) {
+          return res.status(500).json({ success: false, message: '操作失败' });
+        }
+        
+        // 踢掉该IP的所有连接
+        wss.clients.forEach(client => {
+          if (client.readyState === WebSocket.OPEN && wsToUser.has(client)) {
+            const user = wsToUser.get(client);
+            if (user.ip === ip) {
+              client.send(JSON.stringify({
+                type: 'kick',
+                reason: '你的IP已被管理员禁言'
+              }));
+              client.close();
+            }
+          }
+        });
+        
+        res.json({ success: true, message: '已禁言该IP' });
+      });
+    }
+  });
+});
+
+// 23. 管理员发送消息
+app.post('/api/admin/send-msg', (req, res) => {
+  const { roomId, content } = req.body;
+  
+  if (!roomId || !content) {
+    return res.status(400).json({ success: false, message: '参数错误' });
+  }
+  
+  // 获取聊天室名称
+  db.get('SELECT name FROM rooms WHERE id = ?', [roomId], (err, row) => {
+    if (err || !row) {
+      return res.status(500).json({ success: false, message: '聊天室不存在' });
+    }
+    
+    const roomName = row.name;
+    
+    // 保存消息
+    db.run('INSERT INTO messages (username, content, room) VALUES (?, ?, ?)', 
+      ['管理员', content, roomName], (err) => {
+        if (err) {
+          return res.status(500).json({ success: false, message: '发送失败' });
+        }
+        
+        // 广播消息
+        broadcast({
+          type: 'chat',
+          username: '管理员',
+          content,
+          room: roomName
+        });
+        
+        res.json({ success: true, message: '消息发送成功' });
+      }
+    );
+  });
+});
+
+// 24. 管理员管理聊天室
+app.post('/api/admin/room', (req, res) => {
+  const { name, locked } = req.body;
+  
+  if (!name) {
+    return res.status(400).json({ success: false, message: '参数错误' });
+  }
+  
+  db.run('INSERT INTO rooms (name, creator, locked, muted, visible) VALUES (?, ?, ?, 0, 1)', 
+    [name, 'admin', locked ? 1 : 0], (err) => {
+      if (err) {
+        return res.status(500).json({ success: false, message: '创建失败' });
+      }
+      res.json({ success: true, message: '聊天室创建成功' });
+    }
+  );
+});
+
+app.put('/api/admin/room/:id', (req, res) => {
+  const { id } = req.params;
+  const { name, locked } = req.body;
+  
+  if (!name) {
+    return res.status(400).json({ success: false, message: '参数错误' });
+  }
+  
+  db.run('UPDATE rooms SET name = ?, locked = ? WHERE id = ?', 
+    [name, locked ? 1 : 0, id], (err) => {
+      if (err) {
+        return res.status(500).json({ success: false, message: '修改失败' });
+      }
+      res.json({ success: true, message: '聊天室修改成功' });
+    }
+  );
+});
+
+app.delete('/api/admin/room/:id', (req, res) => {
+  const { id } = req.params;
+  
+  // 先获取聊天室名称
+  db.get('SELECT name FROM rooms WHERE id = ?', [id], (err, row) => {
+    if (err || !row) {
+      return res.status(500).json({ success: false, message: '聊天室不存在' });
+    }
+    
+    const roomName = row.name;
+    
+    // 事务：删除聊天室 + 相关消息
+    db.serialize(() => {
+      db.run('BEGIN TRANSACTION');
+      db.run('DELETE FROM rooms WHERE id = ?', [id]);
+      db.run('DELETE FROM messages WHERE room = ?', [roomName]);
+      db.run('COMMIT', (err) => {
+        if (err) {
+          db.run('ROLLBACK');
+          return res.status(500).json({ success: false, message: '删除失败' });
+        }
+        res.json({ success: true, message: '聊天室删除成功' });
+      });
+    });
+  });
+});
+
 // 在线用户映射：username => ws
 const userMap = new Map();
-// ws => { username, room }
+// ws => { username, room, ip }
 const wsToUser = new WeakMap();
 
 // WebSocket 实时处理核心
-wss.on('connection', (ws) => {
-  console.log('新的WebSocket连接');
+wss.on('connection', (ws, req) => {
+  const ip = req.socket.remoteAddress;
+  console.log(`新的WebSocket连接，IP: ${ip}`);
+
+  // 检查IP是否被禁言
+  db.get('SELECT ip FROM muted_ips WHERE ip = ?', [ip], (err, row) => {
+    if (row) {
+      ws.send(JSON.stringify({
+        type: 'kick',
+        reason: '你的IP已被管理员禁言'
+      }));
+      ws.close();
+      return;
+    }
+  });
 
   // 接收客户端消息
   ws.on('message', (message) => {
@@ -505,9 +969,9 @@ wss.on('connection', (ws) => {
             oldWs.close(4001, 'replaced');
           }
 
-          // 绑定用户和房间
+          // 绑定用户、房间、IP
           userMap.set(username, ws);
-          wsToUser.set(ws, { username, room });
+          wsToUser.set(ws, { username, room, ip });
 
           // 广播用户上线（仅同房间）
           if (room) {
@@ -525,18 +989,30 @@ wss.on('connection', (ws) => {
       if (data.type === 'chat') {
         const { username, content, room } = data;
         if (username && content && room) {
-          // 保存到数据库
-          db.run('INSERT INTO messages (username, content, room) VALUES (?, ?, ?)',
-            [username, content, room], (err) => {
-              if (err) console.error('保存群聊消息失败:', err);
-            });
+          // 检查房间是否上锁
+          db.get('SELECT locked FROM rooms WHERE name = ?', [room], (err, row) => {
+            if (row && row.locked) {
+              ws.send(JSON.stringify({
+                type: 'system',
+                content: '该聊天室已被上锁，无法发送消息',
+                room: room
+              }));
+              return;
+            }
 
-                    // 广播给同房间所有用户
-          broadcast({
-            type: 'chat',
-            username,
-            content,
-            room
+            // 保存到数据库
+            db.run('INSERT INTO messages (username, content, room) VALUES (?, ?, ?)',
+              [username, content, room], (err) => {
+                if (err) console.error('保存群聊消息失败:', err);
+              });
+
+            // 广播给同房间所有用户
+            broadcast({
+              type: 'chat',
+              username,
+              content,
+              room
+            });
           });
         }
       }
@@ -555,7 +1031,7 @@ wss.on('connection', (ws) => {
             });
           }
           // 更新房间
-          wsToUser.set(ws, { username, room });
+          wsToUser.set(ws, { ...old, room });
           // 进入新房间广播
           broadcast({
             type: 'system',
@@ -627,6 +1103,7 @@ wss.on('connection', (ws) => {
       });
     }
     wsToUser.delete(ws);
+    console.log('WebSocket连接关闭');
   });
 
   ws.on('error', (err) => {
@@ -646,16 +1123,10 @@ function broadcast(msg) {
   });
 }
 
+// 静态文件服务
+app.use(express.static('public'));
+
 // 启动服务
 server.listen(PORT, () => {
   console.log(`服务器运行在端口 ${PORT}`);
-});
-
-// 关闭数据库连接
-process.on('SIGINT', () => {
-  db.close((err) => {
-    if (err) console.error('关闭数据库失败:', err.message);
-    else console.log('数据库连接已关闭');
-    process.exit(0);
-  });
 });

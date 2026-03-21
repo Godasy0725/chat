@@ -296,7 +296,7 @@ app.post('/api/add-friend', (req, res) => {
               return res.status(500).json({ success: false, message: '发送申请失败' });
             }
 
-            // 通知对方
+            // 实时通知对方
             if (userMap.has(to)) {
               const ws = userMap.get(to);
               ws.send(JSON.stringify({
@@ -460,7 +460,7 @@ app.get('/api/private-history', (req, res) => {
   });
 });
 
-// 13. 发送私聊消息
+// 13. 保存私聊消息
 app.post('/api/send-private', (req, res) => {
   const { sender, receiver, content } = req.body;
 
@@ -468,36 +468,13 @@ app.post('/api/send-private', (req, res) => {
     return res.status(400).json({ success: false, message: '参数错误' });
   }
 
-  // 检查是否是好友
-  db.get(`SELECT id FROM friends WHERE (user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)`, 
-    [sender, receiver, receiver, sender], (err, row) => {
+  // 保存私聊消息到数据库
+  db.run('INSERT INTO private_messages (sender, receiver, content) VALUES (?, ?, ?)', 
+    [sender, receiver, content], (err) => {
       if (err) {
-        return res.status(500).json({ success: false, message: '服务器内部错误' });
+        return res.status(500).json({ success: false, message: '保存失败' });
       }
-      if (!row) {
-        return res.status(400).json({ success: false, message: '非好友无法私聊' });
-      }
-
-      // 保存私聊消息
-      db.run('INSERT INTO private_messages (sender, receiver, content) VALUES (?, ?, ?)', 
-        [sender, receiver, content], (err) => {
-          if (err) {
-            return res.status(500).json({ success: false, message: '发送失败' });
-          }
-
-          // 通知对方
-          if (userMap.has(receiver)) {
-            const ws = userMap.get(receiver);
-            ws.send(JSON.stringify({
-              type: 'private_msg',
-              sender: sender,
-              content: content
-            }));
-          }
-
-          res.json({ success: true, message: '发送成功' });
-        }
-      );
+      res.json({ success: true, message: '发送成功' });
     }
   );
 });
@@ -507,7 +484,7 @@ const userMap = new Map();
 // ws => { username, room }
 const wsToUser = new WeakMap();
 
-// WebSocket 处理
+// WebSocket 实时处理核心
 wss.on('connection', (ws) => {
   console.log('新的WebSocket连接');
 
@@ -515,10 +492,11 @@ wss.on('connection', (ws) => {
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message);
+      console.log('收到客户端消息:', data);
       
-      // 客户端登录WebSocket
+      // 客户端登录（绑定用户）
       if (data.type === 'login') {
-        const { username, room = '喵喵粉丝群' } = data;
+        const { username, room = '' } = data;
         if (username) {
           // 单处登录：踢旧
           if (userMap.has(username)) {
@@ -532,86 +510,145 @@ wss.on('connection', (ws) => {
           wsToUser.set(ws, { username, room });
 
           // 广播用户上线（仅同房间）
-          broadcast({
-            type: 'system',
-            content: `${username} 加入了聊天室`,
-            room: room
-          });
-          console.log(`${username} 进入房间 ${room}`);
+          if (room) {
+            broadcast({
+              type: 'system',
+              content: `${username} 加入了聊天室`,
+              room: room
+            });
+            console.log(`${username} 进入房间 ${room}`);
+          }
         }
       }
 
-      // 客户端发送群聊消息
-      if (data.type === 'chat' && wsToUser.has(ws)) {
-        const userInfo = wsToUser.get(ws);
-        const { username } = userInfo;
-        const { content, room = '喵喵粉丝群' } = data;
+      // 群聊消息（实时广播）
+      if (data.type === 'chat') {
+        const { username, content, room } = data;
+        if (username && content && room) {
+          // 保存到数据库
+          db.run('INSERT INTO messages (username, content, room) VALUES (?, ?, ?)',
+            [username, content, room], (err) => {
+              if (err) console.error('保存群聊消息失败:', err);
+            });
 
-        // 保存消息到数据库
-        db.run('INSERT INTO messages (username, content, room) VALUES (?, ?, ?)',
-          [username, content, room], (err) => {
-            if (err) console.error('保存消息失败:', err);
+                    // 广播给同房间所有用户
+          broadcast({
+            type: 'chat',
+            username,
+            content,
+            room
           });
-
-        // 广播消息给同房间所有用户
-        broadcast({
-          type: 'chat',
-          username,
-          content,
-          room
-        });
+        }
       }
-    } catch (error) {
-      console.error('消息处理失败:', error);
+
+      // 切换房间
+      if (data.type === 'switch_room') {
+        const { username, room } = data;
+        if (username && room && wsToUser.has(ws)) {
+          const old = wsToUser.get(ws);
+          // 离开旧房间广播
+          if (old.room) {
+            broadcast({
+              type: 'system',
+              content: `${old.username} 离开了聊天室`,
+              room: old.room
+            });
+          }
+          // 更新房间
+          wsToUser.set(ws, { username, room });
+          // 进入新房间广播
+          broadcast({
+            type: 'system',
+            content: `${username} 加入了聊天室`,
+            room
+          });
+        }
+      }
+
+      // 私聊消息（实时）
+      if (data.type === 'private_msg') {
+        const { sender, receiver, content } = data;
+        if (sender && receiver && content) {
+          // 推送给接收方
+          if (userMap.has(receiver)) {
+            const targetWs = userMap.get(receiver);
+            targetWs.send(JSON.stringify({
+              type: 'private_msg',
+              sender,
+              receiver,
+              content
+            }));
+          }
+          // 自己也收到一份回显
+          ws.send(JSON.stringify({
+            type: 'private_msg',
+            sender,
+            receiver,
+            content
+          }));
+        }
+      }
+
+      // 好友申请/同意/拒绝 实时通知
+      if (data.type === 'friend_response') {
+        const { to, message } = data;
+        if (userMap.has(to)) {
+          userMap.get(to).send(JSON.stringify({
+            type: 'friend_response',
+            message
+          }));
+        }
+      }
+
+      // 改名同步
+      if (data.type === 'rename') {
+        const { oldName, newName } = data;
+        if (userMap.has(oldName)) {
+          const wsObj = userMap.get(oldName);
+          userMap.delete(oldName);
+          userMap.set(newName, wsObj);
+        }
+      }
+    } catch (e) {
+      console.error('消息解析错误', e);
     }
   });
 
-  // 连接关闭
+  // 断开连接
   ws.on('close', () => {
-    if (wsToUser.has(ws)) {
-      const { username, room } = wsToUser.get(ws);
-      // 移除映射
-      userMap.delete(username);
-      wsToUser.delete(ws);
-      // 广播用户下线
+    const user = wsToUser.get(ws);
+    if (user) {
+      userMap.delete(user.username);
+      // 离线广播
       broadcast({
         type: 'system',
-        content: `${username} 离开了聊天室`,
-        room: room
+        content: `${user.username} 离开了聊天室`,
+        room: user.room
       });
-      console.log(`${username} 离开房间 ${room}`);
     }
-    console.log('WebSocket连接关闭');
+    wsToUser.delete(ws);
   });
 
-  // 错误处理
-  ws.on('error', (error) => {
-    console.error('WebSocket错误:', error);
+  ws.on('error', (err) => {
+    console.error('ws error', err);
   });
 });
 
-// 广播消息（仅发送给同房间的在线用户）
-function broadcast(message) {
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      const clientInfo = wsToUser.get(client);
-      if (clientInfo && clientInfo.room === message.room) {
-        client.send(JSON.stringify(message));
+// 房间广播
+function broadcast(msg) {
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && wsToUser.has(client)) {
+      const u = wsToUser.get(client);
+      if (u.room === msg.room) {
+        client.send(JSON.stringify(msg));
       }
     }
   });
 }
 
-// 健康检查接口
-app.get('/', (req, res) => {
-  res.send('聊天室后端服务运行中 ✨');
-});
-
-// 启动服务器
+// 启动服务
 server.listen(PORT, () => {
   console.log(`服务器运行在端口 ${PORT}`);
-  console.log(`后端地址: https://chat-051o.onrender.com`);
-  console.log(`允许跨域的前端地址: ${FRONTEND_DOMAIN}`);
 });
 
 // 关闭数据库连接

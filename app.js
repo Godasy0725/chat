@@ -82,7 +82,7 @@ const db = new sqlite3.Database('./database.db', (err) => {
       if (err) console.error('创建好友关系表失败:', err.message);
     });
 
-    // 新增：房间表（一人一个）
+    // 房间表（一人一个）
     db.run(`CREATE TABLE IF NOT EXISTS rooms (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL UNIQUE,
@@ -92,7 +92,7 @@ const db = new sqlite3.Database('./database.db', (err) => {
       if (err) console.error('创建房间表失败:', err.message);
     });
 
-    // 新增：房间禁言表
+    // 房间禁言表
     db.run(`CREATE TABLE IF NOT EXISTS room_mutes (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       room TEXT NOT NULL,
@@ -103,7 +103,7 @@ const db = new sqlite3.Database('./database.db', (err) => {
       if (err) console.error('创建禁言表失败:', err.message);
     });
 
-    // 新增：房间黑名单（踢人）
+    // 房间黑名单（踢人）
     db.run(`CREATE TABLE IF NOT EXISTS room_bans (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       room TEXT NOT NULL,
@@ -251,6 +251,9 @@ app.post('/api/rename', (req, res) => {
           wsToUser.set(ws, { username: newName, room: wsToUser.get(ws).room });
         }
         
+        // 广播房间列表更新
+        broadcastRoomList();
+        
         res.json({ success: true, message: '昵称修改成功' });
       });
     });
@@ -293,6 +296,10 @@ app.post('/api/delete-account', (req, res) => {
         db.run('ROLLBACK');
         return res.status(500).json({ success: false, message: '注销失败' });
       }
+      
+      // 广播房间列表更新
+      broadcastRoomList();
+      
       res.json({ success: true, message: '账号注销成功' });
     });
   });
@@ -523,8 +530,18 @@ app.post('/api/send-private', (req, res) => {
   );
 });
 
-// ------------------- 新增：房间管理接口 -------------------
-// 14. 创建房间（一人一个）
+// ------------------- 房间管理核心接口 -------------------
+// 14. 获取所有房间列表（修复其他人看不到房间的核心接口）
+app.get('/api/all-rooms', (req, res) => {
+  db.all('SELECT name, owner FROM rooms ORDER BY created_at ASC', (err, rows) => {
+    if (err) {
+      return res.status(500).json({ success: false, message: '获取房间列表失败' });
+    }
+    res.json({ success: true, rooms: rows || [] });
+  });
+});
+
+// 15. 创建房间（一人一个）
 app.post('/api/create-room', (req, res) => {
   const { username, name } = req.body;
 
@@ -555,27 +572,12 @@ app.post('/api/create-room', (req, res) => {
         if (err) {
           return res.status(500).json({ success: false, message: '创建失败' });
         }
+        
+        // 关键：创建房间后立即广播更新，所有在线用户实时看到新房间
+        broadcastRoomList();
+        
         res.json({ success: true, message: '房间创建成功' });
       });
-    });
-  });
-});
-
-// 15. 获取我的房间
-app.get('/api/my-room', (req, res) => {
-  const { username } = req.query;
-
-  if (!username) {
-    return res.status(400).json({ success: false, message: '参数错误' });
-  }
-
-  db.get('SELECT name FROM rooms WHERE owner = ?', [username], (err, row) => {
-    if (err) {
-      return res.status(500).json({ success: false, message: '服务器错误' });
-    }
-    res.json({ 
-      success: true, 
-      room: row ? { name: row.name } : null 
     });
   });
 });
@@ -766,12 +768,16 @@ app.post('/api/dismiss-room', (req, res) => {
           }
         });
 
+        // 广播房间列表更新
+        broadcastRoomList();
+
         res.json({ success: true, message: '解散成功' });
       });
     });
   });
 });
 
+// ------------------- WebSocket 核心逻辑 -------------------
 // 在线用户映射：username => ws
 const userMap = new Map();
 // ws => { username, room }
@@ -974,6 +980,15 @@ function broadcast(msg) {
       if (u.room === msg.room) {
         client.send(JSON.stringify(msg));
       }
+    }
+  });
+}
+
+// 核心：广播房间列表更新（所有在线用户实时刷新房间列表）
+function broadcastRoomList() {
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify({ type: 'room_list_update' }));
     }
   });
 }

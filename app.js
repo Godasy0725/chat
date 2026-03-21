@@ -2,182 +2,187 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const sqlite3 = require('sqlite3').verbose();
+const cors = require('cors');
+const bodyParser = require('body-parser');
 const crypto = require('crypto');
-const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// 数据库初始化
-const db = new sqlite3.Database('./database.db', (err) => {
-  if (err) console.error('数据库连接失败:', err.message);
-  else console.log('数据库连接成功');
+const PORT = process.env.PORT || 3000;
+const FRONTEND_DOMAIN = 'https://lmx.is-best.net';
+
+app.use(cors({
+  origin: FRONTEND_DOMAIN,
+  credentials: true
+}));
+app.use(bodyParser.json());
+
+// 数据库
+const db = new sqlite3.Database('./database.db', err => {
+  if (err) console.error('DB error', err.message);
+  else console.log('DB connected');
 });
 
-// 创建用户表、消息表
-db.run(`
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+// 创建表
+db.run(`CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  username TEXT NOT NULL UNIQUE,
+  password TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)`);
 
-db.run(`
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    username TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id)
-  )
-`);
+db.run(`CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  username TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)`);
 
-// 全局变量：在线用户映射（userId => WebSocket连接）
-const onlineUsers = new Map();
-
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-
-// 注册接口
-app.post('/api/register', (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) {
-    return res.json({ success: false, message: '用户名和密码不能为空' });
-  }
-
-  // 生成唯一随机ID（不可修改）
-  const userId = crypto.randomBytes(8).toString('hex');
-
-  db.run(
-    'INSERT INTO users (id, username, password) VALUES (?, ?, ?)',
-    [userId, username, password],
-    (err) => {
-      if (err) {
-        if (err.message.includes('UNIQUE constraint failed')) {
-          return res.json({ success: false, message: '用户名已存在' });
-        }
-        return res.json({ success: false, message: '注册失败' });
-      }
-      res.json({ success: true, message: '注册成功' });
-    }
-  );
-});
-
-// 登录接口
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
-  db.get(
-    'SELECT id, username FROM users WHERE username = ? AND password = ?',
-    [username, password],
-    (err, row) => {
-      if (err) return res.json({ success: false, message: '登录失败' });
-      if (!row) return res.json({ success: false, message: '用户名或密码错误' });
-      res.json({
-        success: true,
-        data: { userId: row.id, username: row.username }
+// 生成唯一ID
+function generateUniqueUserId() {
+  return new Promise((resolve, reject) => {
+    function gen() {
+      const id = crypto.randomBytes(4).toString('hex').toUpperCase();
+      db.get('SELECT id FROM users WHERE id = ?', [id], (err, row) => {
+        if (err) return reject(err);
+        if (row) return gen();
+        resolve(id);
       });
     }
-  );
+    gen();
+  });
+}
+
+// 注册
+app.post('/api/register', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password)
+      return res.status(400).json({ success: false, message: '不能为空' });
+
+    db.get('SELECT username FROM users WHERE username = ?', [username], async (err, row) => {
+      if (row) return res.status(400).json({ success: false, message: '用户名已存在' });
+      const userId = await generateUniqueUserId();
+      db.run('INSERT INTO users (id, username, password) VALUES (?,?,?)',
+        [userId, username, password],
+        err => {
+          if (err) return res.status(500).json({ success: false });
+          res.json({ success: true, data: { userId, username } });
+        }
+      );
+    });
+  } catch (e) {
+    res.status(500).json({ success: false });
+  }
 });
 
-// WebSocket连接处理
-wss.on('connection', (ws) => {
-  let currentUser = null;
+// 登录（单账号唯一）
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password)
+    return res.status(400).json({ success: false, message: '不能为空' });
 
-  ws.on('message', (data) => {
+  db.get('SELECT id, username FROM users WHERE username=? AND password=?',
+    [username, password], (err, user) => {
+      if (err || !user)
+        return res.status(401).json({ success: false, message: '账号或密码错误' });
+
+      // 顶掉旧连接
+      if (userMap.has(user.id)) {
+        const oldWs = userMap.get(user.id);
+        oldWs.send(JSON.stringify({ type: 'kick', reason: '你的账号在别处登录' }));
+        oldWs.close(4001, 'replaced');
+      }
+
+      res.json({ success: true, data: { userId: user.id, username: user.username } });
+    });
+});
+
+// 获取历史消息
+app.get('/api/history', (req, res) => {
+  db.all(`SELECT user_id, username, content,
+          datetime(created_at, '+8 hours') as created_at
+          FROM messages
+          ORDER BY id ASC
+          LIMIT 500`, (err, rows) => {
+    if (err) return res.status(500).json({ success: false });
+    res.json({ success: true, list: rows });
+  });
+});
+
+// 在线用户映射：userId => ws
+const userMap = new Map();
+// ws => userId
+const wsToUid = new WeakMap();
+
+wss.on('connection', ws => {
+  ws.on('message', data => {
     try {
       const msg = JSON.parse(data);
-
       if (msg.type === 'login') {
         const { userId, username } = msg;
-        currentUser = { userId, username };
+        if (!userId) return;
 
-        // 单设备登录：如果已在线，踢掉旧连接
-        if (onlineUsers.has(userId)) {
-          const oldWs = onlineUsers.get(userId);
-          oldWs.send(JSON.stringify({
-            type: 'system',
-            content: '您的账号在其他设备登录，已被强制下线'
-          }));
-          oldWs.close();
+        // 单处登录：踢旧
+        if (userMap.has(userId)) {
+          const old = userMap.get(userId);
+          old.send(JSON.stringify({ type: 'kick', reason: '账号在别处登录' }));
+          old.close(4001, 'replaced');
         }
 
-        // 保存当前连接
-        onlineUsers.set(userId, ws);
+        userMap.set(userId, ws);
+        wsToUid.set(ws, userId);
+
+        // 广播上线
         broadcast({
           type: 'system',
-          content: `${username} (ID: ${userId}) 加入了聊天室`
-        });
-
-        // 加载历史消息
-        loadHistoryMessages(ws);
-
-      } else if (msg.type === 'chat' && currentUser) {
-        const { content } = msg;
-        // 存储消息到数据库
-        db.run(
-          'INSERT INTO messages (user_id, username, content) VALUES (?, ?, ?)',
-          [currentUser.userId, currentUser.username, content],
-          (err) => {
-            if (err) console.error('消息存储失败:', err);
-          }
-        );
-        // 广播消息
-        broadcast({
-          type: 'chat',
-          userId: currentUser.userId,
-          username: currentUser.username,
-          content
+          content: `${username} (ID:${userId}) 加入聊天室`
         });
       }
-    } catch (e) {
-      console.error('消息解析错误:', e);
-    }
+
+      // 聊天消息 + 入库
+      if (msg.type === 'chat') {
+        const userId = wsToUid.get(ws);
+        if (!userId) return;
+
+        db.get('SELECT username FROM users WHERE id=?', [userId], (err, row) => {
+          if (!row) return;
+          const username = row.username;
+          // 存库
+          db.run('INSERT INTO messages (user_id, username, content) VALUES (?,?,?)',
+            [userId, username, msg.content]);
+          // 广播
+          broadcast({
+            type: 'chat',
+            userId,
+            username,
+            content: msg.content
+          });
+        });
+      }
+    } catch (e) {}
   });
 
   ws.on('close', () => {
-    if (currentUser) {
-      onlineUsers.delete(currentUser.userId);
-      broadcast({
-        type: 'system',
-        content: `${currentUser.username} (ID: ${currentUser.userId}) 离开了聊天室`
-      });
+    const userId = wsToUid.get(ws);
+    if (userId) {
+      userMap.delete(userId);
+      wsToUid.delete(ws);
     }
   });
 });
 
-// 广播消息
 function broadcast(data) {
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify(data));
-    }
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify(data));
   });
 }
 
-// 加载历史消息
-function loadHistoryMessages(ws) {
-  db.all(
-    'SELECT user_id, username, content, created_at FROM messages ORDER BY created_at ASC LIMIT 100',
-    (err, rows) => {
-      if (err) return console.error('加载历史消息失败:', err);
-      rows.forEach((row) => {
-        ws.send(JSON.stringify({
-          type: 'chat',
-          userId: row.user_id,
-          username: row.username,
-          content: row.content
-        }));
-      });
-    }
-  );
-}
+app.get('/', (req, res) => res.send('running'));
 
-const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`服务器运行在端口 ${PORT}`);
+  console.log(`Server on ${PORT}`);
 });

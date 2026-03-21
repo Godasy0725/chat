@@ -198,3 +198,37 @@ app.get('/api/history', (req, res) => {
     res.json({ success: true, list: rows });
   });
 });
+
+// 1. 修改 messages 表（增加 room 字段）
+db.run(`CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  username TEXT NOT NULL,
+  content TEXT NOT NULL,
+  room TEXT NOT NULL DEFAULT '喵喵粉丝群',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)`);
+
+// 2. 修改历史消息接口（按房间筛选）
+app.get('/api/history', (req, res) => {
+  const { room } = req.query;
+  db.all(`SELECT user_id, username, content,
+          datetime(created_at, '+8 hours') as created_at
+          FROM messages
+          WHERE room = ?
+          ORDER BY id ASC
+          LIMIT 500`, [room || '喵喵粉丝群'], (err, rows) => {
+    if (err) return res.status(500).json({ success: false });
+    res.json({ success: true, list: rows });
+  });
+});
+
+// 3. 修改 WebSocket 广播逻辑（只发给同房间）
+function broadcast(data) {
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) {
+      // 前端发送时已带 room，这里只发给同房间
+      c.send(JSON.stringify(data));
+    }
+  });
+}

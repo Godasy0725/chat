@@ -1,5 +1,4 @@
 {
-  "name": "full_chat_system",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {

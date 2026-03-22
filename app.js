@@ -1,488 +1,664 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const sqlite3 = require('sqlite3').verbose();
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const PORT = process.env.PORT || 3000;
-const FRONTEND_DOMAIN = 'https://lmx.is-best.net';
-
-app.use(cors({ origin: FRONTEND_DOMAIN, credentials: true }));
+// 中间件
+app.use(cors());
 app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
 
-const db = new sqlite3.Database('./database.db', (err) => {
-  if (err) console.error('数据库连接失败:', err.message);
-  else {
-    console.log('成功连接到SQLite数据库');
-    db.run(`CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY,password TEXT NOT NULL,created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);
-    db.run(`CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL,content TEXT NOT NULL,room TEXT NOT NULL DEFAULT '喵喵粉丝群',created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);
-    db.run(`CREATE TABLE IF NOT EXISTS private_messages (id INTEGER PRIMARY KEY AUTOINCREMENT,sender TEXT NOT NULL,receiver TEXT NOT NULL,content TEXT NOT NULL,created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);
-    db.run(`CREATE TABLE IF NOT EXISTS friend_applies (id INTEGER PRIMARY KEY AUTOINCREMENT,from_user TEXT NOT NULL,to_user TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',created_at DATETIME DEFAULT CURRENT_TIMESTAMP,UNIQUE(from_user, to_user))`);
-    db.run(`CREATE TABLE IF NOT EXISTS friends (id INTEGER PRIMARY KEY AUTOINCREMENT,user1 TEXT NOT NULL,user2 TEXT NOT NULL,created_at DATETIME DEFAULT CURRENT_TIMESTAMP,UNIQUE(user1, user2))`);
-    db.run(`CREATE TABLE IF NOT EXISTS rooms (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL UNIQUE,owner TEXT NOT NULL UNIQUE,created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);
-    db.run(`CREATE TABLE IF NOT EXISTS room_mutes (id INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT NOT NULL,username TEXT NOT NULL,created_at DATETIME DEFAULT CURRENT_TIMESTAMP,UNIQUE(room, username))`);
-    db.run(`CREATE TABLE IF NOT EXISTS room_bans (id INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT NOT NULL,username TEXT NOT NULL,created_at DATETIME DEFAULT CURRENT_TIMESTAMP,UNIQUE(room, username))`);
-  }
-});
+// 内存数据库（实际项目建议用MongoDB/MySQL）
+const users = new Map(); // { username: { password, avatar } }
+const rooms = new Map(); // { roomName: { owner, users: Set, muted: Set, messages: Array } }
+const friendApplies = new Map(); // { to: [{ from, time }] }
+const friends = new Map(); // { user: Set(friends) }
+const privateMessages = new Map(); // { "user1-user2": Array }
 
-// 1. 注册
-app.post('/api/register', (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ success: false, message: '用户名和密码不能为空' });
-  db.get('SELECT username FROM users WHERE username = ?', [username], (err, row) => {
-    if (err) return res.status(500).json({ success: false, message: '服务器内部错误' });
-    if (row) return res.status(400).json({ success: false, message: '用户名已存在' });
-    db.run('INSERT INTO users (username, password) VALUES (?, ?)', [username, password], (err) => {
-      if (err) return res.status(500).json({ success: false, message: '服务器内部错误' });
-      res.status(200).json({ success: true, message: '注册成功', data: { username } });
-    });
-  });
-});
+// 工具函数
+function hashPassword(pwd) {
+  return crypto.createHash('md5').update(pwd).digest('hex');
+}
 
-// 2. 登录
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ success: false, message: '用户名和密码不能为空' });
-  db.get('SELECT username FROM users WHERE username = ? AND password = ?', [username, password], (err, row) => {
-    if (err) return res.status(500).json({ success: false, message: '服务器内部错误' });
-    if (!row) return res.status(401).json({ success: false, message: '用户名或密码错误' });
-    if (userMap.has(username)) {
-      const oldWs = userMap.get(username);
-      oldWs.send(JSON.stringify({ type: 'kick', reason: '你的账号在其他设备登录' }));
-      oldWs.close(4001, 'replaced');
-    }
-    res.status(200).json({ success: true, message: '登录成功', data: { username } });
-  });
-});
+function getPrivateKey(user1, user2) {
+  return [user1, user2].sort().join('-');
+}
 
-// 3. 修改昵称
-app.post('/api/rename', (req, res) => {
-  const { oldName, newName } = req.body;
-  if (!oldName || !newName || oldName === newName) return res.status(400).json({ success: false, message: '参数错误' });
-  db.get('SELECT username FROM users WHERE username = ?', [newName], (err, row) => {
-    if (err) return res.status(500).json({ success: false, message: '服务器内部错误' });
-    if (row) return res.status(400).json({ success: false, message: '新昵称已被使用' });
-    db.serialize(() => {
-      db.run('BEGIN TRANSACTION');
-      db.run('UPDATE users SET username = ? WHERE username = ?', [newName, oldName]);
-      db.run('UPDATE messages SET username = ? WHERE username = ?', [newName, oldName]);
-      db.run('UPDATE private_messages SET sender = ? WHERE sender = ?', [newName, oldName]);
-      db.run('UPDATE private_messages SET receiver = ? WHERE receiver = ?', [newName, oldName]);
-      db.run('UPDATE friend_applies SET from_user = ? WHERE from_user = ?', [newName, oldName]);
-      db.run('UPDATE friend_applies SET to_user = ? WHERE to_user = ?', [newName, oldName]);
-      db.run('UPDATE friends SET user1 = ? WHERE user1 = ?', [newName, oldName]);
-      db.run('UPDATE friends SET user2 = ? WHERE user2 = ?', [newName, oldName]);
-      db.run('UPDATE rooms SET owner = ? WHERE owner = ?', [newName, oldName]);
-      db.run('UPDATE room_mutes SET username = ? WHERE username = ?', [newName, oldName]);
-      db.run('UPDATE room_bans SET username = ? WHERE username = ?', [newName, oldName]);
-      db.run('COMMIT', (err) => {
-        if (err) { db.run('ROLLBACK'); return res.status(500).json({ success: false, message: '修改失败' }); }
-        if (userMap.has(oldName)) {
-          const ws = userMap.get(oldName);
-          userMap.delete(oldName);
-          userMap.set(newName, ws);
-          wsToUser.set(ws, { username: newName, room: wsToUser.get(ws).room });
-        }
-        broadcastRoomList();
-        res.json({ success: true, message: '昵称修改成功' });
-      });
-    });
-  });
-});
-
-// 4. 注销账号
-app.post('/api/delete-account', (req, res) => {
-  const { username } = req.body;
-  if (!username) return res.status(400).json({ success: false, message: '参数错误' });
-  if (userMap.has(username)) {
-    const oldWs = userMap.get(username);
-    oldWs.close();
-    userMap.delete(username);
-  }
-  db.serialize(() => {
-    db.run('BEGIN TRANSACTION');
-    db.run('DELETE FROM users WHERE username = ?', [username]);
-    db.run('DELETE FROM messages WHERE username = ?', [username]);
-    db.run('DELETE FROM private_messages WHERE sender = ? OR receiver = ?', [username, username]);
-    db.run('DELETE FROM friend_applies WHERE from_user = ? OR to_user = ?', [username, username]);
-    db.run('DELETE FROM friends WHERE user1 = ? OR user2 = ?', [username, username]);
-    db.run('DELETE FROM rooms WHERE owner = ?', [username]);
-    db.run('DELETE FROM room_mutes WHERE username = ?', [username]);
-    db.run('DELETE FROM room_bans WHERE username = ?', [username]);
-    db.run('COMMIT', (err) => {
-      if (err) { db.run('ROLLBACK'); return res.status(500).json({ success: false, message: '注销失败' }); }
-      broadcastRoomList();
-      res.json({ success: true, message: '账号注销成功' });
-    });
-  });
-});
-
-// 5. 添加好友
-app.post('/api/add-friend', (req, res) => {
-  const { from, to } = req.body;
-  if (!from || !to || from === to) return res.status(400).json({ success: false, message: '参数错误' });
-  db.get('SELECT username FROM users WHERE username = ?', [to], (err, row) => {
-    if (err) return res.status(500).json({ success: false, message: '服务器内部错误' });
-    if (!row) return res.status(400).json({ success: false, message: '用户不存在' });
-    db.get('SELECT id FROM friend_applies WHERE from_user = ? AND to_user = ?', [from, to], (err, row) => {
-      if (err) return res.status(500).json({ success: false, message: '服务器内部错误' });
-      if (row) return res.status(400).json({ success: false, message: '已发送好友申请' });
-      db.get(`SELECT id FROM friends WHERE (user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)`, [from, to, to, from], (err, row) => {
-        if (err) return res.status(500).json({ success: false, message: '服务器内部错误' });
-        if (row) return res.status(400).json({ success: false, message: '已是好友' });
-        db.run('INSERT INTO friend_applies (from_user, to_user) VALUES (?, ?)', [from, to], (err) => {
-          if (err) return res.status(500).json({ success: false, message: '发送申请失败' });
-          if (userMap.has(to)) {
-            userMap.get(to).send(JSON.stringify({ type: 'friend_apply', from: from }));
-          }
-          res.json({ success: true, message: '好友申请发送成功' });
-        });
-      });
-    });
-  });
-});
-
-// 6. 同意好友（修复：实时通知双方刷新好友列表）
-app.post('/api/agree-friend', (req, res) => {
-  const { from, to } = req.body;
-  if (!from || !to) return res.status(400).json({ success: false, message: '参数错误' });
-  db.serialize(() => {
-    db.run('BEGIN TRANSACTION');
-    db.run('UPDATE friend_applies SET status = ? WHERE from_user = ? AND to_user = ?', ['agreed', from, to]);
-    db.run('INSERT INTO friends (user1, user2) VALUES (?, ?)', [from, to]);
-    db.run('COMMIT', (err) => {
-      if (err) { db.run('ROLLBACK'); return res.status(500).json({ success: false, message: '同意失败' }); }
-      
-      // 关键修复：同意后，实时通知双方刷新好友列表
-      if (userMap.has(from)) {
-        userMap.get(from).send(JSON.stringify({ type: 'friend_list_update' }));
-      }
-      if (userMap.has(to)) {
-        userMap.get(to).send(JSON.stringify({ type: 'friend_list_update' }));
-      }
-      
-      res.json({ success: true, message: '已同意好友申请' });
-    });
-  });
-});
-
-// 7. 拒绝好友
-app.post('/api/reject-friend', (req, res) => {
-  const { from, to } = req.body;
-  if (!from || !to) return res.status(400).json({ success: false, message: '参数错误' });
-  db.run('UPDATE friend_applies SET status = ? WHERE from_user = ? AND to_user = ?', ['rejected', from, to], (err) => {
-    if (err) return res.status(500).json({ success: false, message: '拒绝失败' });
-    res.json({ success: true, message: '已拒绝好友申请' });
-  });
-});
-
-// 8. 删除好友（修复：实时通知双方刷新好友列表）
-app.post('/api/delete-friend', (req, res) => {
-  const { user, friend } = req.body;
-  if (!user || !friend) return res.status(400).json({ success: false, message: '参数错误' });
-  db.run(`DELETE FROM friends WHERE (user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)`, [user, friend, friend, user], (err) => {
-    if (err) return res.status(500).json({ success: false, message: '删除失败' });
-    
-    // 关键修复：删除后，实时通知双方刷新好友列表
-    if (userMap.has(user)) {
-      userMap.get(user).send(JSON.stringify({ type: 'friend_list_update' }));
-    }
-    if (userMap.has(friend)) {
-      userMap.get(friend).send(JSON.stringify({ type: 'friend_list_update' }));
-    }
-    
-    res.json({ success: true, message: '好友删除成功' });
-  });
-});
-
-// 9. 获取好友申请
-app.get('/api/friend-apply', (req, res) => {
-  const { username } = req.query;
-  if (!username) return res.status(400).json({ success: false, message: '参数错误' });
-  db.all('SELECT from_user FROM friend_applies WHERE to_user = ? AND status = ?', [username, 'pending'], (err, rows) => {
-    if (err) return res.status(500).json({ success: false, message: '获取失败' });
-    res.json({ success: true, list: rows.map(row => ({ from: row.from_user })) });
-  });
-});
-
-// 10. 获取好友列表
-app.get('/api/friend-list', (req, res) => {
-  const { username } = req.query;
-  if (!username) return res.status(400).json({ success: false, message: '参数错误' });
-  db.all(`SELECT CASE WHEN user1 = ? THEN user2 ELSE user1 END as friend FROM friends WHERE user1 = ? OR user2 = ?`, [username, username, username], (err, rows) => {
-    if (err) return res.status(500).json({ success: false, message: '获取失败' });
-    res.json({ success: true, list: rows.map(row => row.friend) });
-  });
-});
-
-// 11. 获取群聊历史
-app.get('/api/history', (req, res) => {
-  const { room = '喵喵粉丝群' } = req.query;
-  db.all(`SELECT username, content, datetime(created_at, '+8 hours') as created_at FROM messages WHERE room = ? ORDER BY id ASC LIMIT 500`, [room], (err, rows) => {
-    if (err) return res.status(500).json({ success: false, message: '获取历史消息失败' });
-    res.json({ success: true, list: rows });
-  });
-});
-
-// 12. 获取私聊历史
-app.get('/api/private-history', (req, res) => {
-  const { user, friend } = req.query;
-  if (!user || !friend) return res.status(400).json({ success: false, message: '参数错误' });
-  db.all(`SELECT sender, content, datetime(created_at, '+8 hours') as created_at FROM private_messages WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?) ORDER BY id ASC LIMIT 500`, [user, friend, friend, user], (err, rows) => {
-    if (err) return res.status(500).json({ success: false, message: '获取私聊记录失败' });
-    res.json({ success: true, list: rows });
-  });
-});
-
-// 13. 保存私聊消息
-app.post('/api/send-private', (req, res) => {
-  const { sender, receiver, content } = req.body;
-  if (!sender || !receiver || !content) return res.status(400).json({ success: false, message: '参数错误' });
-  db.run('INSERT INTO private_messages (sender, receiver, content) VALUES (?, ?, ?)', [sender, receiver, content], (err) => {
-    if (err) return res.status(500).json({ success: false, message: '保存失败' });
-    res.json({ success: true, message: '发送成功' });
-  });
-});
-
-// 14. 获取所有房间
-app.get('/api/all-rooms', (req, res) => {
-  db.all('SELECT name, owner FROM rooms ORDER BY created_at ASC', (err, rows) => {
-    if (err) return res.status(500).json({ success: false, message: '获取房间列表失败' });
-    res.json({ success: true, rooms: rows || [] });
-  });
-});
-
-// 15. 创建房间
-app.post('/api/create-room', (req, res) => {
-  const { username, name } = req.body;
-  if (!username || !name) return res.status(400).json({ success: false, message: '参数错误' });
-  db.get('SELECT name FROM rooms WHERE owner = ?', [username], (err, row) => {
-    if (err) return res.status(500).json({ success: false, message: '服务器错误' });
-    if (row) return res.status(400).json({ success: false, message: '你已创建过房间：' + row.name });
-    db.get('SELECT id FROM rooms WHERE name = ?', [name], (err, row) => {
-      if (err) return res.status(500).json({ success: false, message: '服务器错误' });
-      if (row) return res.status(400).json({ success: false, message: '房间名已存在' });
-      db.run('INSERT INTO rooms (name, owner) VALUES (?, ?)', [name, username], (err) => {
-        if (err) return res.status(500).json({ success: false, message: '创建失败' });
-        broadcastRoomList();
-        res.json({ success: true, message: '房间创建成功' });
-      });
-    });
-  });
-});
-
-// 16. 踢人
-app.post('/api/kick', (req, res) => {
-  const { owner, room, username } = req.body;
-  if (!owner || !room || !username) return res.status(400).json({ success: false, message: '参数错误' });
-  db.get('SELECT id FROM rooms WHERE name = ? AND owner = ?', [room, owner], (err, row) => {
-    if (err || !row) return res.status(403).json({ success: false, message: '你不是该房间群主' });
-    if (username === owner) return res.status(400).json({ success: false, message: '不能踢自己' });
-    db.run('INSERT OR IGNORE INTO room_bans (room, username) VALUES (?, ?)', [room, username], (err) => {
-      if (err) return res.status(500).json({ success: false, message: '操作失败' });
-      if (userMap.has(username)) {
-        userMap.get(username).send(JSON.stringify({ type: 'room_kicked', room: room, reason: '你被群主踢出房间' }));
-        if (wsToUser.get(userMap.get(username))?.room === room) {
-          wsToUser.set(userMap.get(username), { username: username, room: '' });
-        }
-      }
-      broadcast({ type: 'system', content: `${username} 被群主踢出房间`, room: room });
-      res.json({ success: true, message: '踢人成功' });
-    });
-  });
-});
-
-// 17. 禁言
-app.post('/api/mute', (req, res) => {
-  const { owner, room, username } = req.body;
-  if (!owner || !room || !username) return res.status(400).json({ success: false, message: '参数错误' });
-  db.get('SELECT id FROM rooms WHERE name = ? AND owner = ?', [room, owner], (err, row) => {
-    if (err || !row) return res.status(403).json({ success: false, message: '你不是该房间群主' });
-    if (username === owner) return res.status(400).json({ success: false, message: '不能禁言自己' });
-    db.run('INSERT OR IGNORE INTO room_mutes (room, username) VALUES (?, ?)', [room, username], (err) => {
-      if (err) return res.status(500).json({ success: false, message: '操作失败' });
-      if (userMap.has(username)) {
-        userMap.get(username).send(JSON.stringify({ type: 'room_muted', room: room, reason: '你被群主禁言' }));
-      }
-      broadcast({ type: 'system', content: `${username} 被群主禁言`, room: room });
-      res.json({ success: true, message: '禁言成功' });
-    });
-  });
-});
-
-// 18. 清空房间消息
-app.post('/api/clear-room', (req, res) => {
-  const { owner, room } = req.body;
-  if (!owner || !room) return res.status(400).json({ success: false, message: '参数错误' });
-  db.get('SELECT id FROM rooms WHERE name = ? AND owner = ?', [room, owner], (err, row) => {
-    if (err || !row) return res.status(403).json({ success: false, message: '你不是该房间群主' });
-    db.run('DELETE FROM messages WHERE room = ?', [room], (err) => {
-      if (err) return res.status(500).json({ success: false, message: '操作失败' });
-      broadcast({ type: 'system', content: '群主清空了所有聊天记录', room: room });
-      res.json({ success: true, message: '清空成功' });
-    });
-  });
-});
-
-// 19. 解散房间
-app.post('/api/dismiss-room', (req, res) => {
-  const { owner, room } = req.body;
-  if (!owner || !room) return res.status(400).json({ success: false, message: '参数错误' });
-  db.get('SELECT id FROM rooms WHERE name = ? AND owner = ?', [room, owner], (err, row) => {
-    if (err || !row) return res.status(403).json({ success: false, message: '你不是该房间群主' });
-    db.serialize(() => {
-      db.run('BEGIN TRANSACTION');
-      db.run('DELETE FROM rooms WHERE name = ?', [room]);
-      db.run('DELETE FROM messages WHERE room = ?', [room]);
-      db.run('DELETE FROM room_mutes WHERE room = ?', [room]);
-      db.run('DELETE FROM room_bans WHERE room = ?', [room]);
-      db.run('COMMIT', (err) => {
-        if (err) { db.run('ROLLBACK'); return res.status(500).json({ success: false, message: '操作失败' }); }
-        broadcast({ type: 'system', content: '房间已被群主解散', room: room });
-        wss.clients.forEach(client => {
-          if (client.readyState === WebSocket.OPEN && wsToUser.has(client)) {
-            const u = wsToUser.get(client);
-            if (u.room === room) {
-              client.send(JSON.stringify({ type: 'room_dismissed', room: room, reason: '房间已解散' }));
-              wsToUser.set(client, { username: u.username, room: '' });
-            }
-          }
-        });
-        broadcastRoomList();
-        res.json({ success: true, message: '解散成功' });
-      });
-    });
-  });
-});
-
-// WebSocket 核心
-const userMap = new Map();
-const wsToUser = new WeakMap();
-
-wss.on('connection', (ws) => {
-  ws.on('message', (message) => {
-    try {
-      const data = JSON.parse(message);
-      if (data.type === 'login') {
-        const { username, room = '' } = data;
-        if (username) {
-          if (userMap.has(username)) {
-            const oldWs = userMap.get(username);
-            oldWs.send(JSON.stringify({ type: 'kick', reason: '你的账号在别处登录' }));
-            oldWs.close(4001, 'replaced');
-          }
-          userMap.set(username, ws);
-          wsToUser.set(ws, { username, room });
-          if (room) {
-            broadcast({ type: 'system', content: `${username} 加入了聊天室`, room: room });
-          }
-        }
-      }
-      if (data.type === 'chat') {
-        const { username, content, room } = data;
-        if (username && content && room) {
-          db.get('SELECT id FROM room_mutes WHERE room = ? AND username = ?', [room, username], (err, row) => {
-            if (row) {
-              ws.send(JSON.stringify({ type: 'system', content: '你已被禁言，无法发送消息', room: room }));
-              return;
-            }
-            db.get('SELECT id FROM room_bans WHERE room = ? AND username = ?', [room, username], (err, row) => {
-              if (row) {
-                ws.send(JSON.stringify({ type: 'system', content: '你已被踢出房间，无法发送消息', room: room }));
-                return;
-              }
-              db.run('INSERT INTO messages (username, content, room) VALUES (?, ?, ?)', [username, content, room], (err) => {
-                if (err) console.error('保存群聊消息失败:', err);
-              });
-              broadcast({ type: 'chat', username, content, room });
-            });
-          });
-        }
-      }
-      if (data.type === 'switch_room') {
-        const { username, room } = data;
-        if (username && room && wsToUser.has(ws)) {
-          const old = wsToUser.get(ws);
-          if (old.room) {
-            broadcast({ type: 'system', content: `${old.username} 离开了聊天室`, room: old.room });
-          }
-          db.get('SELECT id FROM room_bans WHERE room = ? AND username = ?', [room, username], (err, row) => {
-            if (row) {
-              ws.send(JSON.stringify({ type: 'system', content: '你已被该房间拉黑，无法进入', room: room }));
-              return;
-            }
-            wsToUser.set(ws, { username, room });
-            broadcast({ type: 'system', content: `${username} 加入了聊天室`, room: room });
-          });
-        }
-      }
-      if (data.type === 'private_msg') {
-        const { sender, receiver, content } = data;
-        if (sender && receiver && content) {
-          if (userMap.has(receiver)) {
-            userMap.get(receiver).send(JSON.stringify({ type: 'private_msg', sender, receiver, content }));
-          }
-          ws.send(JSON.stringify({ type: 'private_msg', sender, receiver, content }));
-        }
-      }
-      if (data.type === 'friend_response') {
-        const { to, message } = data;
-        if (userMap.has(to)) {
-          userMap.get(to).send(JSON.stringify({ type: 'friend_response', message }));
-        }
-      }
-      if (data.type === 'rename') {
-        const { oldName, newName } = data;
-        if (userMap.has(oldName)) {
-          const wsObj = userMap.get(oldName);
-          userMap.delete(oldName);
-          userMap.set(newName, wsObj);
-        }
-      }
-    } catch (e) {
-      console.error('消息解析错误', e);
-    }
-  });
-
-  ws.on('close', () => {
-    const user = wsToUser.get(ws);
-    if (user) {
-      userMap.delete(user.username);
-      broadcast({ type: 'system', content: `${user.username} 离开了聊天室`, room: user.room });
-    }
-    wsToUser.delete(ws);
-  });
-
-  ws.on('error', (err) => {
-    console.error('ws error', err);
-  });
-});
-
-function broadcast(msg) {
+// 广播消息到房间
+function broadcast(room, data) {
   wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN && wsToUser.has(client)) {
-      const u = wsToUser.get(client);
-      if (u.room === msg.room) {
-        client.send(JSON.stringify(msg));
-      }
+    if (client.readyState === WebSocket.OPEN && client.room === room) {
+      client.send(JSON.stringify(data));
     }
   });
 }
 
-function broadcastRoomList() {
+// 发送私聊消息
+function sendPrivateMsg(sender, receiver, content) {
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.username === receiver) {
+      client.send(JSON.stringify({
+        type: 'private_msg',
+        sender,
+        receiver,
+        content
+      }));
+    }
+  });
+  // 保存私聊记录
+  const key = getPrivateKey(sender, receiver);
+  if (!privateMessages.has(key)) privateMessages.set(key, []);
+  privateMessages.get(key).push({
+    sender,
+    receiver,
+    content,
+    time: new Date().toISOString()
+  });
+}
+
+// WebSocket连接
+wss.on('connection', (ws) => {
+  ws.username = '';
+  ws.room = '';
+
+  ws.on('message', (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      
+      // 登录
+      if (data.type === 'login') {
+        ws.username = data.username;
+        ws.send(JSON.stringify({ type: 'login_success', username: data.username }));
+      }
+
+      // 切换房间
+      if (data.type === 'switch_room') {
+        ws.room = data.room;
+        if (!rooms.has(data.room)) {
+          ws.send(JSON.stringify({ type: 'error', message: '房间不存在' }));
+          return;
+        }
+        const room = rooms.get(data.room);
+        room.users.add(data.username);
+        broadcast(data.room, {
+          type: 'system',
+          room: data.room,
+          content: `${data.username} 加入房间`
+        });
+        // 发送在线人数
+        broadcast(data.room, {
+          type: 'online',
+          room: data.room,
+          count: room.users.size
+        });
+      }
+
+      // 发送群消息
+      if (data.type === 'chat') {
+        const room = rooms.get(data.room);
+        if (!room) return;
+        
+        // 检查是否被禁言
+        if (room.muted.has(data.username)) {
+          ws.send(JSON.stringify({
+            type: 'room_muted',
+            message: '你已被禁言，无法发送消息'
+          }));
+          return;
+        }
+
+        // 保存消息并广播
+        room.messages.push({
+          username: data.username,
+          content: data.content,
+          time: new Date().toISOString()
+        });
+        broadcast(data.room, {
+          type: 'chat',
+          room: data.room,
+          username: data.username,
+          content: data.content,
+          time: new Date().toISOString()
+        });
+      }
+
+      // 发送私聊消息
+      if (data.type === 'private_msg') {
+        sendPrivateMsg(data.sender, data.receiver, data.content);
+      }
+
+    } catch (e) {
+      console.error('WebSocket消息解析错误:', e);
+    }
+  });
+
+  // 断开连接
+  ws.on('close', () => {
+    if (ws.username && ws.room && rooms.has(ws.room)) {
+      const room = rooms.get(ws.room);
+      room.users.delete(ws.username);
+      broadcast(ws.room, {
+        type: 'system',
+        room: ws.room,
+        content: `${ws.username} 离开房间`
+      });
+      broadcast(ws.room, {
+        type: 'online',
+        room: ws.room,
+        count: room.users.size
+      });
+    }
+  });
+});
+
+// HTTP接口
+
+// 注册
+app.post('/api/register', (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.json({ success: false, message: '用户名和密码不能为空' });
+  }
+  if (users.has(username)) {
+    return res.json({ success: false, message: '用户名已存在' });
+  }
+  users.set(username, {
+    password: hashPassword(password),
+    avatar: username.charAt(0).toUpperCase()
+  });
+  // 初始化好友列表
+  friends.set(username, new Set());
+  res.json({ success: true, message: '注册成功' });
+});
+
+// 登录
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body;
+  if (!users.has(username)) {
+    return res.json({ success: false, message: '用户名不存在' });
+  }
+  const user = users.get(username);
+  if (user.password !== hashPassword(password)) {
+    return res.json({ success: false, message: '密码错误' });
+  }
+  res.json({
+    success: true,
+    data: { username, avatar: user.avatar }
+  });
+});
+
+// 创建房间
+app.post('/api/create-room', (req, res) => {
+  const { username, name } = req.body;
+  if (!name) return res.json({ success: false, message: '房间名不能为空' });
+  if (rooms.has(name)) return res.json({ success: false, message: '房间已存在' });
+  
+  rooms.set(name, {
+    owner: username,
+    users: new Set(),
+    muted: new Set(),
+    messages: []
+  });
+  
+  // 通知所有客户端更新房间列表
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify({ type: 'room_list_update' }));
     }
   });
-}
+  
+  res.json({ success: true, message: '房间创建成功' });
+});
 
+// 获取所有房间
+app.get('/api/all-rooms', (req, res) => {
+  const roomList = [];
+  rooms.forEach((value, key) => {
+    roomList.push({
+      name: key,
+      owner: value.owner,
+      userCount: value.users.size
+    });
+  });
+  res.json({ success: true, rooms: roomList });
+});
+
+// 踢出用户
+app.post('/api/kick', (req, res) => {
+  const { owner, room, username } = req.body;
+  if (!rooms.has(room)) return res.json({ success: false, message: '房间不存在' });
+  const roomData = rooms.get(room);
+  
+  if (roomData.owner !== owner) {
+    return res.json({ success: false, message: '只有群主可以踢出用户' });
+  }
+  
+  if (!roomData.users.has(username)) {
+    return res.json({ success: false, message: '用户不在房间内' });
+  }
+  
+  // 踢出用户
+  roomData.users.delete(username);
+  // 通知被踢出用户
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.username === username) {
+      client.send(JSON.stringify({
+        type: 'room_kicked',
+        room,
+        reason: '你被群主踢出房间'
+      }));
+      client.room = '';
+    }
+  });
+  
+  broadcast(room, {
+    type: 'system',
+    room,
+    content: `${username} 被踢出房间`
+  });
+  
+  res.json({ success: true, message: '踢出成功' });
+});
+
+// 禁言用户
+app.post('/api/mute', (req, res) => {
+  const { owner, room, username } = req.body;
+  if (!rooms.has(room)) return res.json({ success: false, message: '房间不存在' });
+  const roomData = rooms.get(room);
+  
+  if (roomData.owner !== owner) {
+    return res.json({ success: false, message: '只有群主可以禁言用户' });
+  }
+  
+  if (!roomData.users.has(username)) {
+    return res.json({ success: false, message: '用户不在房间内' });
+  }
+  
+  roomData.muted.add(username);
+  
+  // 通知被禁言用户
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.username === username) {
+      client.send(JSON.stringify({
+        type: 'room_muted',
+        message: '你已被群主禁言'
+      }));
+    }
+  });
+  
+  broadcast(room, {
+    type: 'system',
+    room,
+    content: `${username} 被禁言`
+  });
+  
+  res.json({ success: true, message: '禁言成功' });
+});
+
+// 解除禁言（新增）
+app.post('/api/unmute', (req, res) => {
+  const { owner, room, username } = req.body;
+  if (!rooms.has(room)) return res.json({ success: false, message: '房间不存在' });
+  const roomData = rooms.get(room);
+  
+  if (roomData.owner !== owner) {
+    return res.json({ success: false, message: '只有群主可以解除禁言' });
+  }
+  
+  if (!roomData.muted.has(username)) {
+    return res.json({ success: false, message: '该用户未被禁言' });
+  }
+  
+  roomData.muted.delete(username);
+  
+  // 通知被解除禁言用户
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.username === username) {
+      client.send(JSON.stringify({
+        type: 'room_unmuted',
+        message: '你已被解除禁言'
+      }));
+    }
+  });
+  
+  broadcast(room, {
+    type: 'system',
+    room,
+    content: `${username} 被解除禁言`
+  });
+  
+  res.json({ success: true, message: '解除禁言成功' });
+});
+
+// 清空房间消息
+app.post('/api/clear-room', (req, res) => {
+  const { owner, room } = req.body;
+  if (!rooms.has(room)) return res.json({ success: false, message: '房间不存在' });
+  const roomData = rooms.get(room);
+  
+  if (roomData.owner !== owner) {
+    return res.json({ success: false, message: '只有群主可以清空聊天' });
+  }
+  
+  roomData.messages = [];
+  broadcast(room, {
+    type: 'system',
+    room,
+    content: '聊天记录已被群主清空'
+  });
+  
+  res.json({ success: true, message: '清空成功' });
+});
+
+// 解散房间
+app.post('/api/dismiss-room', (req, res) => {
+  const { owner, room } = req.body;
+  if (!rooms.has(room)) return res.json({ success: false, message: '房间不存在' });
+  const roomData = rooms.get(room);
+  
+  if (roomData.owner !== owner) {
+    return res.json({ success: false, message: '只有群主可以解散房间' });
+  }
+  
+  // 通知所有房间用户
+  broadcast(room, {
+    type: 'room_dismissed',
+    room,
+    message: '房间已被群主解散'
+  });
+  
+  // 清空房间用户的room标识
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.room === room) {
+      client.room = '';
+    }
+  });
+  
+  rooms.delete(room);
+  
+  // 通知更新房间列表
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify({ type: 'room_list_update' }));
+    }
+  });
+  
+  res.json({ success: true, message: '房间已解散' });
+});
+
+// 获取房间聊天记录
+app.get('/api/history', (req, res) => {
+  const { room } = req.query;
+  if (!rooms.has(room)) return res.json({ success: false, message: '房间不存在' });
+  res.json({
+    success: true,
+    list: rooms.get(room).messages
+  });
+});
+
+// 添加好友
+app.post('/api/add-friend', (req, res) => {
+  const { from, to } = req.body;
+  if (!users.has(to)) return res.json({ success: false, message: '用户不存在' });
+  if (from === to) return res.json({ success: false, message: '不能添加自己为好友' });
+  
+  // 检查是否已是好友
+  if (friends.has(from) && friends.get(from).has(to)) {
+    return res.json({ success: false, message: '已是好友' });
+  }
+  
+  // 保存好友申请
+  if (!friendApplies.has(to)) friendApplies.set(to, []);
+  // 去重
+  const applies = friendApplies.get(to);
+  if (applies.some(item => item.from === from)) {
+    return res.json({ success: false, message: '已发送过申请' });
+  }
+  
+  applies.push({ from, time: new Date().toISOString() });
+  
+  // 通知被申请人
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.username === to) {
+      client.send(JSON.stringify({
+        type: 'friend_apply',
+        from
+      }));
+    }
+  });
+  
+  res.json({ success: true, message: '好友申请已发送' });
+});
+
+// 获取好友申请
+app.get('/api/friend-apply', (req, res) => {
+  const { username } = req.query;
+  const applies = friendApplies.get(username) || [];
+  res.json({ success: true, list: applies });
+});
+
+// 同意好友
+app.post('/api/agree-friend', (req, res) => {
+  const { from, to } = req.body;
+  
+  // 移除申请
+  if (friendApplies.has(to)) {
+    const applies = friendApplies.get(to);
+    friendApplies.set(to, applies.filter(item => item.from !== from));
+  }
+  
+  // 添加好友关系（双向）
+  if (!friends.has(from)) friends.set(from, new Set());
+  friends.get(from).add(to);
+  
+  if (!friends.has(to)) friends.set(to, new Set());
+  friends.get(to).add(from);
+  
+  // 通知双方
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      if (client.username === from) {
+        client.send(JSON.stringify({
+          type: 'friend_response',
+          message: `${to} 同意了你的好友申请`
+        }));
+      }
+      if (client.username === to) {
+        client.send(JSON.stringify({
+          type: 'friend_response',
+          message: `已成功添加 ${from} 为好友`
+        }));
+      }
+    }
+  });
+  
+  // 通知更新好友列表
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && (client.username === from || client.username === to)) {
+      client.send(JSON.stringify({ type: 'friend_list_update' }));
+    }
+  });
+  
+  res.json({ success: true, message: '添加好友成功' });
+});
+
+// 拒绝好友
+app.post('/api/reject-friend', (req, res) => {
+  const { from, to } = req.body;
+  
+  // 移除申请
+  if (friendApplies.has(to)) {
+    const applies = friendApplies.get(to);
+    friendApplies.set(to, applies.filter(item => item.from !== from));
+  }
+  
+  // 通知申请人
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.username === from) {
+      client.send(JSON.stringify({
+        type: 'friend_response',
+        message: `${to} 拒绝了你的好友申请`
+      }));
+    }
+  });
+  
+  res.json({ success: true, message: '已拒绝好友申请' });
+});
+
+// 获取好友列表
+app.get('/api/friend-list', (req, res) => {
+  const { username } = req.query;
+  const friendList = friends.has(username) ? Array.from(friends.get(username)) : [];
+  res.json({ success: true, list: friendList });
+});
+
+// 删除好友（新增）
+app.post('/api/delete-friend', (req, res) => {
+  const { user, friend } = req.body;
+  
+  // 移除双向好友关系
+  if (friends.has(user)) {
+    friends.get(user).delete(friend);
+  }
+  if (friends.has(friend)) {
+    friends.get(friend).delete(user);
+  }
+  
+  // 通知对方
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.username === friend) {
+      client.send(JSON.stringify({
+        type: 'friend_response',
+        message: `${user} 已将你删除好友`
+      }));
+    }
+  });
+  
+  // 通知更新好友列表
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && (client.username === user || client.username === friend)) {
+      client.send(JSON.stringify({ type: 'friend_list_update' }));
+    }
+  });
+  
+  res.json({ success: true, message: '删除好友成功' });
+});
+
+// 发送私聊消息（备用接口）
+app.post('/api/send-private', (req, res) => {
+  const { sender, receiver, content } = req.body;
+  sendPrivateMsg(sender, receiver, content);
+  res.json({ success: true, message: '消息发送成功' });
+});
+
+// 获取私聊记录
+app.get('/api/private-history', (req, res) => {
+  const { user, friend } = req.query;
+  const key = getPrivateKey(user, friend);
+  const history = privateMessages.get(key) || [];
+  res.json({ success: true, list: history });
+});
+
+// 修改昵称
+app.post('/api/rename', (req, res) => {
+  const { oldName, newName } = req.body;
+  if (!users.has(oldName)) return res.json({ success: false, message: '用户不存在' });
+  if (users.has(newName)) return res.json({ success: false, message: '昵称已被占用' });
+  
+  // 更新用户名
+  const userData = users.get(oldName);
+  users.delete(oldName);
+  users.set(newName, userData);
+  
+  // 更新好友关系
+  friends.forEach((friendSet, username) => {
+    if (friendSet.has(oldName)) {
+      friendSet.delete(oldName);
+      friendSet.add(newName);
+    }
+  });
+  if (friends.has(oldName)) {
+    friends.set(newName, friends.get(oldName));
+    friends.delete(oldName);
+  }
+  
+  // 更新房间相关
+  rooms.forEach((roomData, roomName) => {
+    if (roomData.owner === oldName) {
+      roomData.owner = newName;
+    }
+    if (roomData.users.has(oldName)) {
+      roomData.users.delete(oldName);
+      roomData.users.add(newName);
+    }
+    if (roomData.muted.has(oldName)) {
+      roomData.muted.delete(oldName);
+      roomData.muted.add(newName);
+    }
+  });
+  
+  // 通知客户端
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.username === oldName) {
+      client.username = newName;
+      client.send(JSON.stringify({
+        type: 'rename_success',
+        newName
+      }));
+    }
+  });
+  
+  res.json({ success: true, message: '昵称修改成功' });
+});
+
+// 删除账号
+app.post('/api/delete-account', (req, res) => {
+  const { username } = req.body;
+  if (!users.has(username)) return res.json({ success: false, message: '用户不存在' });
+  
+  // 移除用户
+  users.delete(username);
+  
+  // 移除好友关系
+  friends.delete(username);
+  friends.forEach((friendSet) => {
+    friendSet.delete(username);
+  });
+  
+  // 移除好友申请
+  friendApplies.forEach((applies, to) => {
+    friendApplies.set(to, applies.filter(item => item.from !== username));
+  });
+  friendApplies.delete(username);
+  
+  // 移除房间（如果是群主）
+  rooms.forEach((roomData, roomName) => {
+    if (roomData.owner === username) {
+      rooms.delete(roomName);
+    } else {
+      roomData.users.delete(username);
+      roomData.muted.delete(username);
+    }
+  });
+  
+  // 通知客户端
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.username === username) {
+      client.send(JSON.stringify({ type: 'account_deleted' }));
+      client.close();
+    }
+  });
+  
+  res.json({ success: true, message: '账号已注销' });
+});
+
+// 启动服务器
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`服务器运行在端口 ${PORT}`);
+  console.log(`服务器运行在 http://localhost:${PORT}`);
 });

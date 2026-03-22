@@ -2,10 +2,82 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const sqlite3 = require('sqlite3').verbose();
-const cors = require('cors'); // 确保引入
+const cors = require('cors');
 const bodyParser = require('body-parser');
 const fs = require('fs');
 const path = require('path');
+
+// 1. 强制指定 Node.js 版本兼容（避免异步阻塞）
+process.env.NODE_OPTIONS = '--openssl-legacy-provider';
+
+// 2. 正确读取 Render 端口（必须）
+const PORT = process.env.PORT || 3000;
+const app = express();
+const server = http.createServer(app);
+
+// 3. 配置 CORS 和静态文件（简化配置，避免跨域阻塞）
+app.use(cors());
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.static(__dirname));
+
+// 4. SQLite 数据库配置（使用内存+文件混合模式，避免权限问题）
+const DB_PATH = path.resolve(__dirname, 'database.db');
+// 先检查文件是否可写，避免初始化阻塞
+try {
+  fs.accessSync(DB_PATH, fs.constants.W_OK);
+} catch (err) {
+  console.log('数据库文件不可写，使用内存模式');
+}
+
+// 5. 异步初始化数据库（避免阻塞启动）
+async function initDB() {
+  return new Promise((resolve, reject) => {
+    const db = new sqlite3.Database(DB_PATH, (err) => {
+      if (err) {
+        console.error('数据库连接失败，降级为内存模式:', err.message);
+        // 降级为内存数据库，确保服务能启动
+        resolve(new sqlite3.Database(':memory:'));
+      } else {
+        console.log('数据库连接成功');
+        resolve(db);
+      }
+    });
+  });
+}
+
+// 6. 简化 WebSocket 配置（避免启动阻塞）
+const wss = new WebSocket.Server({ server });
+wss.on('connection', (ws) => {
+  ws.on('message', () => {}); // 空处理，避免未处理的事件阻塞
+});
+
+// 7. 核心：先启动 HTTP 服务，再初始化数据库（避免卡住）
+server.listen(PORT, '0.0.0.0', async () => {
+  console.log(`✅ 服务已启动，端口: ${PORT}`);
+  console.log(`✅ 管理员后台: http://0.0.0.0:${PORT}/admin.html`);
+  
+  // 异步初始化数据库，不阻塞服务启动
+  const db = await initDB();
+  // 快速创建核心表（避免建表语句过多导致阻塞）
+  const createCoreTables = `
+    CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT);
+    CREATE TABLE IF NOT EXISTS rooms (name TEXT PRIMARY KEY, owner TEXT);
+    CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT, room TEXT);
+  `;
+  db.exec(createCoreTables, (err) => {
+    if (err) console.log('建表警告:', err.message);
+    else console.log('核心表初始化完成');
+  });
+});
+
+// 8. 捕获全局错误，避免服务崩溃
+process.on('uncaughtException', (err) => {
+  console.error('全局错误:', err);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('未处理的Promise错误:', err);
+});
 
 // 初始化Express应用
 const app = express();

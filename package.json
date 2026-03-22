@@ -1,34 +1,23 @@
 {
-  "name": "chat-admin-system",
+  "name": "full_chat_system",
   "version": "1.0.0",
-  "description": "聊天室管理系统 - 包含用户端+管理员后台完整功能",
-  "main": "app.js",
+  "description": "完整多功能聊天室（含管理员后台+数据库+WebSocket）",
+  "main": "server.js",
   "scripts": {
-    "start": "node app.js",
-    "dev": "nodemon app.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.16.0",
+    "sqlite3": "^5.1.7"
   },
   "keywords": [
     "chat",
     "websocket",
     "admin",
-    "sqlite3",
-    "express"
+    "sqlite"
   ],
   "author": "",
-  "license": "MIT",
-  "dependencies": {
-    "body-parser": "^1.20.2",
-    "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "multer": "^1.4.5-lts.1",
-    "sqlite3": "^5.1.6",
-    "ws": "^8.16.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.3"
-  },
-  "engines": {
-    "node": ">=14.0.0"
-  }
+  "license": "MIT"
 }

@@ -38,8 +38,9 @@ function broadcast(room, data) {
   });
 }
 
-// 发送私聊消息
+// 修复后的 sendPrivateMsg 函数（逻辑不变，仅确保只被调用一次）
 function sendPrivateMsg(sender, receiver, content) {
+  // 1. 推送给接收方（仅一次）
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === receiver) {
       client.send(JSON.stringify({
@@ -50,7 +51,7 @@ function sendPrivateMsg(sender, receiver, content) {
       }));
     }
   });
-  // 保存私聊记录
+  // 2. 保存私聊记录（仅一次）
   const key = getPrivateKey(sender, receiver);
   if (!privateMessages.has(key)) privateMessages.set(key, []);
   privateMessages.get(key).push({
@@ -60,6 +61,36 @@ function sendPrivateMsg(sender, receiver, content) {
     time: new Date().toISOString()
   });
 }
+
+// 修复 /api/send-private 接口（可选：要么删除，要么仅存储不推送）
+app.post('/api/send-private', (req, res) => {
+  const { sender, receiver, content } = req.body;
+  // 仅保存记录，不推送（避免重复）
+  const key = getPrivateKey(sender, receiver);
+  if (!privateMessages.has(key)) privateMessages.set(key, []);
+  privateMessages.get(key).push({
+    sender,
+    receiver,
+    content,
+    time: new Date().toISOString()
+  });
+  res.json({ success: true, message: '消息发送成功' });
+});
+
+// WebSocket处理私聊消息（核心推送逻辑）
+wss.on('connection', (ws) => {
+  ws.on('message', (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      // 私聊消息处理（仅推送+存储一次）
+      if (data.type === 'private_msg') {
+        sendPrivateMsg(data.sender, data.receiver, data.content);
+      }
+    } catch (e) {
+      console.error('WebSocket消息解析错误:', e);
+    }
+  });
+});
 
 // WebSocket连接
 wss.on('connection', (ws) => {

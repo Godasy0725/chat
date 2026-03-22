@@ -15,15 +15,17 @@ const wss = new WebSocket.Server({ server });
 app.use(cors());
 app.use(bodyParser.json());
 
-// 内存数据库扩展（增加管理员和IP记录）
-const users = new Map(); // { username: { password, avatar, ip, muted: { room: [], private: boolean, all: boolean } } }
-const rooms = new Map(); // { roomName: { owner, users: Set, muted: Set, messages: Array, status: 'show'/'hidden' } }
+// 内存数据库（实际项目建议用MongoDB/MySQL）
+const users = new Map(); // { username: { password, avatar, ip, loginTime, muteRoom: false, mutePrivate: false } }
+const rooms = new Map(); // { roomName: { owner, users: Set, muted: Set, messages: Array, status: 'show/hide' } }
 const friendApplies = new Map(); // { to: [{ from, time }] }
 const friends = new Map(); // { user: Set(friends) }
 const privateMessages = new Map(); // { "user1-user2": Array }
-const userIPs = new Map(); // { username: ip }
-const announcements = []; // 系统公告
-const ADMIN_PASSWORD = 'Lmx%%112233'; // 管理员密码
+const allMessages = []; // 所有消息记录（用于管理员查看）
+
+// 管理员配置
+const ADMIN_PASSWORD = 'Lmx%%112233';
+const ADMIN_TOKEN_EXPIRE = 24 * 60 * 60 * 1000; // 24小时过期
 
 // 工具函数
 function hashPassword(pwd) {
@@ -32,6 +34,19 @@ function hashPassword(pwd) {
 
 function getPrivateKey(user1, user2) {
   return [user1, user2].sort().join('-');
+}
+
+// 验证管理员Token
+function verifyAdminToken(token) {
+  try {
+    const decoded = atob(token).split('-');
+    const timestamp = parseInt(decoded[0]);
+    const pwd = decoded[2];
+    // 检查密码和有效期
+    return pwd === ADMIN_PASSWORD && (Date.now() - timestamp) < ADMIN_TOKEN_EXPIRE;
+  } catch (e) {
+    return false;
+  }
 }
 
 // 广播消息到房间
@@ -43,17 +58,74 @@ function broadcast(room, data) {
   });
 }
 
-// 广播到所有在线用户
-function broadcastAll(data) {
+// 广播管理员公告
+function broadcastAdminNotice(content) {
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify(data));
+      client.send(JSON.stringify({
+        type: 'admin_notice',
+        content
+      }));
     }
+  });
+}
+
+// 发送管理员消息
+function sendAdminMsg(type, target, content) {
+  const msgData = {
+    type: 'admin_msg',
+    target,
+    content,
+    time: new Date().toISOString()
+  };
+  
+  if (type === 'all') {
+    // 发送给所有用户
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify(msgData));
+      }
+    });
+  } else if (type === 'room' && target) {
+    // 发送到指定聊天室
+    broadcast(target, msgData);
+  } else if (type === 'private' && target) {
+    // 发送给指定用户
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN && client.username === target) {
+        client.send(JSON.stringify(msgData));
+      }
+    });
+  }
+  
+  // 记录管理员消息
+  allMessages.push({
+    sender: '管理员',
+    target,
+    content,
+    time: new Date().toISOString(),
+    type: 'admin'
   });
 }
 
 // 发送私聊消息
 function sendPrivateMsg(sender, receiver, content) {
+  // 检查发送方是否被私聊禁言
+  const senderUser = users.get(sender);
+  if (senderUser && senderUser.mutePrivate) {
+    // 通知发送方禁言
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN && client.username === sender) {
+        client.send(JSON.stringify({
+          type: 'private_muted',
+          message: '你已被禁止私聊，无法发送消息'
+        }));
+      }
+    });
+    return;
+  }
+  
+  // 推送消息给接收方
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === receiver) {
       client.send(JSON.stringify({
@@ -64,67 +136,77 @@ function sendPrivateMsg(sender, receiver, content) {
       }));
     }
   });
+  
   // 保存私聊记录
   const key = getPrivateKey(sender, receiver);
   if (!privateMessages.has(key)) privateMessages.set(key, []);
-  privateMessages.get(key).push({
+  const msgObj = {
     sender,
     receiver,
     content,
     time: new Date().toISOString()
+  };
+  privateMessages.get(key).push(msgObj);
+  // 记录到全局消息
+  allMessages.push({
+    ...msgObj,
+    target: receiver,
+    type: 'private'
   });
 }
 
-// 管理员权限校验中间件
-function checkAdmin(req, res, next) {
-  const { password } = req.body;
-  if (hashPassword(password) !== hashPassword(ADMIN_PASSWORD)) {
-    return res.json({ success: false, message: '管理员密码错误' });
-  }
-  next();
-}
-
-// WebSocket连接（增加IP记录）
+// WebSocket连接
 wss.on('connection', (ws, req) => {
   ws.username = '';
   ws.room = '';
-  // 获取客户端真实IP
+  // 获取用户IP
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  ws.ip = ip.replace('::ffff:', ''); // 格式化IPv6地址
-
+  
   ws.on('message', (msg) => {
     try {
       const data = JSON.parse(msg);
       
-      // 登录 - 记录IP
+      // 管理员登录
+      if (data.type === 'admin_login') {
+        if (verifyAdminToken(data.token)) {
+          ws.isAdmin = true;
+          ws.send(JSON.stringify({ type: 'admin_login_success' }));
+        } else {
+          ws.send(JSON.stringify({ type: 'error', message: '管理员验证失败' }));
+          ws.close();
+        }
+        return;
+      }
+      
+      // 普通用户登录
       if (data.type === 'login') {
         ws.username = data.username;
-        userIPs.set(data.username, ws.ip);
-        // 更新用户IP信息
+        // 记录用户IP和登录时间
         if (users.has(data.username)) {
-          const user = users.get(data.username);
-          user.ip = ws.ip;
-          users.set(data.username, user);
+          users.set(data.username, {
+            ...users.get(data.username),
+            ip,
+            loginTime: new Date().toISOString()
+          });
         }
         ws.send(JSON.stringify({ type: 'login_success', username: data.username }));
       }
 
       // 切换房间
       if (data.type === 'switch_room') {
-        // 检查房间是否隐藏
-        const room = rooms.get(data.room);
-        if (!room || room.status === 'hidden') {
-          ws.send(JSON.stringify({ type: 'error', message: '房间不存在或已隐藏' }));
+        ws.room = data.room;
+        if (!rooms.has(data.room)) {
+          ws.send(JSON.stringify({ type: 'error', message: '房间不存在' }));
           return;
         }
-        
-        ws.room = data.room;
+        const room = rooms.get(data.room);
         room.users.add(data.username);
         broadcast(data.room, {
           type: 'system',
           room: data.room,
           content: `${data.username} 加入房间`
         });
+        // 发送在线人数
         broadcast(data.room, {
           type: 'online',
           room: data.room,
@@ -132,14 +214,14 @@ wss.on('connection', (ws, req) => {
         });
       }
 
-      // 发送群消息 - 检查禁言
+      // 发送群消息
       if (data.type === 'chat') {
         const room = rooms.get(data.room);
         if (!room) return;
         
-        // 检查全局禁言/房间禁言
-        const user = users.get(data.username) || { muted: { room: [], private: false, all: false } };
-        if (user.muted.all || user.muted.room.includes(data.room) || room.muted.has(data.username)) {
+        // 检查是否被禁言（房间禁言+全局禁言）
+        const user = users.get(data.username);
+        if (room.muted.has(data.username) || (user && user.muteRoom)) {
           ws.send(JSON.stringify({
             type: 'room_muted',
             message: '你已被禁言，无法发送消息'
@@ -148,30 +230,30 @@ wss.on('connection', (ws, req) => {
         }
 
         // 保存消息并广播
-        room.messages.push({
+        const msgObj = {
           username: data.username,
           content: data.content,
           time: new Date().toISOString()
+        };
+        room.messages.push(msgObj);
+        // 记录到全局消息
+        allMessages.push({
+          sender: data.username,
+          target: data.room,
+          content: data.content,
+          time: new Date().toISOString(),
+          type: 'room'
         });
+        
         broadcast(data.room, {
           type: 'chat',
           room: data.room,
-          username: data.username,
-          content: data.content,
-          time: new Date().toISOString()
+          ...msgObj
         });
       }
 
-      // 发送私聊消息 - 检查禁言
+      // 发送私聊消息
       if (data.type === 'private_msg') {
-        const user = users.get(data.sender) || { muted: { room: [], private: false, all: false } };
-        if (user.muted.all || user.muted.private) {
-          ws.send(JSON.stringify({
-            type: 'private_muted',
-            message: '你已被禁言，无法发送私聊消息'
-          }));
-          return;
-        }
         sendPrivateMsg(data.sender, data.receiver, data.content);
       }
 
@@ -199,7 +281,9 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// ====================== 原有接口（保持不变） ======================
+// HTTP接口
+
+// 注册
 app.post('/api/register', (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
@@ -211,13 +295,17 @@ app.post('/api/register', (req, res) => {
   users.set(username, {
     password: hashPassword(password),
     avatar: username.charAt(0).toUpperCase(),
-    ip: '',
-    muted: { room: [], private: false, all: false }
+    ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+    loginTime: new Date().toISOString(),
+    muteRoom: false,
+    mutePrivate: false
   });
+  // 初始化好友列表
   friends.set(username, new Set());
   res.json({ success: true, message: '注册成功' });
 });
 
+// 登录
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
   if (!users.has(username)) {
@@ -227,12 +315,19 @@ app.post('/api/login', (req, res) => {
   if (user.password !== hashPassword(password)) {
     return res.json({ success: false, message: '密码错误' });
   }
+  // 更新登录信息
+  users.set(username, {
+    ...user,
+    ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+    loginTime: new Date().toISOString()
+  });
   res.json({
     success: true,
     data: { username, avatar: user.avatar }
   });
 });
 
+// 创建房间
 app.post('/api/create-room', (req, res) => {
   const { username, name } = req.body;
   if (!name) return res.json({ success: false, message: '房间名不能为空' });
@@ -243,9 +338,10 @@ app.post('/api/create-room', (req, res) => {
     users: new Set(),
     muted: new Set(),
     messages: [],
-    status: 'show' // 新增状态：show/hidden
+    status: 'show' // 显示/隐藏
   });
   
+  // 通知所有客户端更新房间列表
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify({ type: 'room_list_update' }));
@@ -255,21 +351,21 @@ app.post('/api/create-room', (req, res) => {
   res.json({ success: true, message: '房间创建成功' });
 });
 
+// 获取所有房间
 app.get('/api/all-rooms', (req, res) => {
   const roomList = [];
   rooms.forEach((value, key) => {
-    // 只返回显示的房间
-    if (value.status === 'show') {
-      roomList.push({
-        name: key,
-        owner: value.owner,
-        userCount: value.users.size
-      });
-    }
+    roomList.push({
+      name: key,
+      owner: value.owner,
+      userCount: value.users.size,
+      status: value.status
+    });
   });
   res.json({ success: true, rooms: roomList });
 });
 
+// 踢出用户
 app.post('/api/kick', (req, res) => {
   const { owner, room, username } = req.body;
   if (!rooms.has(room)) return res.json({ success: false, message: '房间不存在' });
@@ -283,7 +379,9 @@ app.post('/api/kick', (req, res) => {
     return res.json({ success: false, message: '用户不在房间内' });
   }
   
+  // 踢出用户
   roomData.users.delete(username);
+  // 通知被踢出用户
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === username) {
       client.send(JSON.stringify({
@@ -304,6 +402,7 @@ app.post('/api/kick', (req, res) => {
   res.json({ success: true, message: '踢出成功' });
 });
 
+// 禁言用户
 app.post('/api/mute', (req, res) => {
   const { owner, room, username } = req.body;
   if (!rooms.has(room)) return res.json({ success: false, message: '房间不存在' });
@@ -319,6 +418,7 @@ app.post('/api/mute', (req, res) => {
   
   roomData.muted.add(username);
   
+  // 通知被禁言用户
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === username) {
       client.send(JSON.stringify({
@@ -337,6 +437,7 @@ app.post('/api/mute', (req, res) => {
   res.json({ success: true, message: '禁言成功' });
 });
 
+// 解除禁言
 app.post('/api/unmute', (req, res) => {
   const { owner, room, username } = req.body;
   if (!rooms.has(room)) return res.json({ success: false, message: '房间不存在' });
@@ -352,6 +453,7 @@ app.post('/api/unmute', (req, res) => {
   
   roomData.muted.delete(username);
   
+  // 通知被解除禁言用户
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === username) {
       client.send(JSON.stringify({
@@ -370,6 +472,7 @@ app.post('/api/unmute', (req, res) => {
   res.json({ success: true, message: '解除禁言成功' });
 });
 
+// 清空房间消息
 app.post('/api/clear-room', (req, res) => {
   const { owner, room } = req.body;
   if (!rooms.has(room)) return res.json({ success: false, message: '房间不存在' });
@@ -389,6 +492,7 @@ app.post('/api/clear-room', (req, res) => {
   res.json({ success: true, message: '清空成功' });
 });
 
+// 解散房间
 app.post('/api/dismiss-room', (req, res) => {
   const { owner, room } = req.body;
   if (!rooms.has(room)) return res.json({ success: false, message: '房间不存在' });
@@ -398,12 +502,14 @@ app.post('/api/dismiss-room', (req, res) => {
     return res.json({ success: false, message: '只有群主可以解散房间' });
   }
   
+  // 通知所有房间用户
   broadcast(room, {
     type: 'room_dismissed',
     room,
     message: '房间已被群主解散'
   });
   
+  // 清空房间用户的room标识
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.room === room) {
       client.room = '';
@@ -412,6 +518,7 @@ app.post('/api/dismiss-room', (req, res) => {
   
   rooms.delete(room);
   
+  // 通知更新房间列表
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify({ type: 'room_list_update' }));
@@ -421,6 +528,7 @@ app.post('/api/dismiss-room', (req, res) => {
   res.json({ success: true, message: '房间已解散' });
 });
 
+// 获取房间聊天记录
 app.get('/api/history', (req, res) => {
   const { room } = req.query;
   if (!rooms.has(room)) return res.json({ success: false, message: '房间不存在' });
@@ -430,16 +538,20 @@ app.get('/api/history', (req, res) => {
   });
 });
 
+// 添加好友
 app.post('/api/add-friend', (req, res) => {
   const { from, to } = req.body;
   if (!users.has(to)) return res.json({ success: false, message: '用户不存在' });
   if (from === to) return res.json({ success: false, message: '不能添加自己为好友' });
   
+  // 检查是否已是好友
   if (friends.has(from) && friends.get(from).has(to)) {
     return res.json({ success: false, message: '已是好友' });
   }
   
+  // 保存好友申请
   if (!friendApplies.has(to)) friendApplies.set(to, []);
+  // 去重
   const applies = friendApplies.get(to);
   if (applies.some(item => item.from === from)) {
     return res.json({ success: false, message: '已发送过申请' });
@@ -447,6 +559,7 @@ app.post('/api/add-friend', (req, res) => {
   
   applies.push({ from, time: new Date().toISOString() });
   
+  // 通知被申请人
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === to) {
       client.send(JSON.stringify({
@@ -459,26 +572,31 @@ app.post('/api/add-friend', (req, res) => {
   res.json({ success: true, message: '好友申请已发送' });
 });
 
+// 获取好友申请
 app.get('/api/friend-apply', (req, res) => {
   const { username } = req.query;
   const applies = friendApplies.get(username) || [];
   res.json({ success: true, list: applies });
 });
 
+// 同意好友
 app.post('/api/agree-friend', (req, res) => {
   const { from, to } = req.body;
   
+  // 移除申请
   if (friendApplies.has(to)) {
     const applies = friendApplies.get(to);
     friendApplies.set(to, applies.filter(item => item.from !== from));
   }
   
+  // 添加好友关系（双向）
   if (!friends.has(from)) friends.set(from, new Set());
   friends.get(from).add(to);
   
   if (!friends.has(to)) friends.set(to, new Set());
   friends.get(to).add(from);
   
+  // 通知双方
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
       if (client.username === from) {
@@ -496,6 +614,7 @@ app.post('/api/agree-friend', (req, res) => {
     }
   });
   
+  // 通知更新好友列表
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && (client.username === from || client.username === to)) {
       client.send(JSON.stringify({ type: 'friend_list_update' }));
@@ -505,14 +624,17 @@ app.post('/api/agree-friend', (req, res) => {
   res.json({ success: true, message: '添加好友成功' });
 });
 
+// 拒绝好友
 app.post('/api/reject-friend', (req, res) => {
   const { from, to } = req.body;
   
+  // 移除申请
   if (friendApplies.has(to)) {
     const applies = friendApplies.get(to);
     friendApplies.set(to, applies.filter(item => item.from !== from));
   }
   
+  // 通知申请人
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === from) {
       client.send(JSON.stringify({
@@ -525,15 +647,18 @@ app.post('/api/reject-friend', (req, res) => {
   res.json({ success: true, message: '已拒绝好友申请' });
 });
 
+// 获取好友列表
 app.get('/api/friend-list', (req, res) => {
   const { username } = req.query;
   const friendList = friends.has(username) ? Array.from(friends.get(username)) : [];
   res.json({ success: true, list: friendList });
 });
 
+// 删除好友
 app.post('/api/delete-friend', (req, res) => {
   const { user, friend } = req.body;
   
+  // 移除双向好友关系
   if (friends.has(user)) {
     friends.get(user).delete(friend);
   }
@@ -541,6 +666,7 @@ app.post('/api/delete-friend', (req, res) => {
     friends.get(friend).delete(user);
   }
   
+  // 通知对方
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === friend) {
       client.send(JSON.stringify({
@@ -550,6 +676,7 @@ app.post('/api/delete-friend', (req, res) => {
     }
   });
   
+  // 通知更新好友列表
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && (client.username === user || client.username === friend)) {
       client.send(JSON.stringify({ type: 'friend_list_update' }));
@@ -559,12 +686,14 @@ app.post('/api/delete-friend', (req, res) => {
   res.json({ success: true, message: '删除好友成功' });
 });
 
+// 发送私聊消息（备用接口）
 app.post('/api/send-private', (req, res) => {
   const { sender, receiver, content } = req.body;
   sendPrivateMsg(sender, receiver, content);
   res.json({ success: true, message: '消息发送成功' });
 });
 
+// 获取私聊记录
 app.get('/api/private-history', (req, res) => {
   const { user, friend } = req.query;
   const key = getPrivateKey(user, friend);
@@ -572,15 +701,18 @@ app.get('/api/private-history', (req, res) => {
   res.json({ success: true, list: history });
 });
 
+// 修改昵称
 app.post('/api/rename', (req, res) => {
   const { oldName, newName } = req.body;
   if (!users.has(oldName)) return res.json({ success: false, message: '用户不存在' });
   if (users.has(newName)) return res.json({ success: false, message: '昵称已被占用' });
   
+  // 更新用户名
   const userData = users.get(oldName);
   users.delete(oldName);
   users.set(newName, userData);
   
+  // 更新好友关系
   friends.forEach((friendSet, username) => {
     if (friendSet.has(oldName)) {
       friendSet.delete(oldName);
@@ -592,6 +724,7 @@ app.post('/api/rename', (req, res) => {
     friends.delete(oldName);
   }
   
+  // 更新房间相关
   rooms.forEach((roomData, roomName) => {
     if (roomData.owner === oldName) {
       roomData.owner = newName;
@@ -606,6 +739,7 @@ app.post('/api/rename', (req, res) => {
     }
   });
   
+  // 通知客户端
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === oldName) {
       client.username = newName;
@@ -619,22 +753,27 @@ app.post('/api/rename', (req, res) => {
   res.json({ success: true, message: '昵称修改成功' });
 });
 
+// 删除账号
 app.post('/api/delete-account', (req, res) => {
   const { username } = req.body;
   if (!users.has(username)) return res.json({ success: false, message: '用户不存在' });
   
+  // 移除用户
   users.delete(username);
   
+  // 移除好友关系
   friends.delete(username);
   friends.forEach((friendSet) => {
     friendSet.delete(username);
   });
   
+  // 移除好友申请
   friendApplies.forEach((applies, to) => {
     friendApplies.set(to, applies.filter(item => item.from !== username));
   });
   friendApplies.delete(username);
   
+  // 移除房间（如果是群主）
   rooms.forEach((roomData, roomName) => {
     if (roomData.owner === username) {
       rooms.delete(roomName);
@@ -644,6 +783,7 @@ app.post('/api/delete-account', (req, res) => {
     }
   });
   
+  // 通知客户端
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === username) {
       client.send(JSON.stringify({ type: 'account_deleted' }));
@@ -654,45 +794,49 @@ app.post('/api/delete-account', (req, res) => {
   res.json({ success: true, message: '账号已注销' });
 });
 
-// ====================== 新增管理员接口 ======================
-// 管理员登录
-app.post('/api/admin/login', checkAdmin, (req, res) => {
-  res.json({ success: true, message: '管理员登录成功' });
-});
+// ====================== 管理员接口 ======================
+// 验证管理员中间件
+function adminAuth(req, res, next) {
+  const token = req.headers['admin-token'];
+  if (!token || !verifyAdminToken(token)) {
+    return res.json({ success: false, message: '管理员验证失败' });
+  }
+  next();
+}
 
-// 用户仪表盘数据
-app.get('/api/admin/dashboard', (req, res) => {
-  const userList = [];
-  users.forEach((user, username) => {
-    // 计算用户加入的房间数
-    let roomCount = 0;
-    rooms.forEach((room) => {
-      if (room.users.has(username)) roomCount++;
-    });
-    // 好友数
-    const friendCount = friends.has(username) ? friends.get(username).size : 0;
-    // 在线状态
-    let online = false;
-    wss.clients.forEach(client => {
-      if (client.username === username && client.readyState === WebSocket.OPEN) {
-        online = true;
-      }
-    });
-    
-    userList.push({
-      username,
-      ip: user.ip || userIPs.get(username) || '未知',
-      online,
-      roomCount,
-      friendCount,
-      muted: user.muted.all || user.muted.private || user.muted.room.length > 0
-    });
+// 仪表盘数据
+app.get('/api/admin/dashboard', adminAuth, (req, res) => {
+  // 在线用户
+  let onlineCount = 0;
+  const userIpList = [];
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.username) {
+      onlineCount++;
+      const user = users.get(client.username);
+      userIpList.push({
+        username: client.username,
+        ip: user?.ip || client._socket.remoteAddress,
+        room: client.room || '',
+        loginTime: user?.loginTime || new Date().toISOString()
+      });
+    }
   });
-  res.json({ success: true, users: userList });
+  
+  // 总消息数
+  const totalMessages = allMessages.length;
+  
+  res.json({
+    success: true,
+    totalUsers: users.size,
+    totalRooms: rooms.size,
+    onlineUsers: onlineCount,
+    totalMessages,
+    userIpList
+  });
 });
 
-// 获取所有聊天室（包括隐藏的）
-app.get('/api/admin/rooms', (req, res) => {
+// 获取所有聊天室
+app.get('/api/admin/rooms', adminAuth, (req, res) => {
   const roomList = [];
   rooms.forEach((value, key) => {
     roomList.push({
@@ -705,32 +849,15 @@ app.get('/api/admin/rooms', (req, res) => {
   res.json({ success: true, rooms: roomList });
 });
 
-// 获取所有用户
-app.get('/api/admin/users', (req, res) => {
-  const userList = [];
-  users.forEach((user, username) => {
-    userList.push({
-      username,
-      ip: user.ip || userIPs.get(username) || '未知',
-      muted: user.muted.all || user.muted.private || user.muted.room.length > 0
-    });
-  });
-  res.json({ success: true, users: userList });
-});
-
 // 新增聊天室
-app.post('/api/admin/add-room', (req, res) => {
+app.post('/api/admin/add-room', adminAuth, (req, res) => {
   const { name, owner } = req.body;
   if (!name || !owner) {
-    return res.json({ success: false, message: '房间名和群主不能为空' });
+    return res.json({ success: false, message: '参数不能为空' });
   }
   if (rooms.has(name)) {
-    return res.json({ success: false, message: '房间已存在' });
+    return res.json({ success: false, message: '聊天室已存在' });
   }
-  if (!users.has(owner)) {
-    return res.json({ success: false, message: '群主用户不存在' });
-  }
-  
   rooms.set(name, {
     owner,
     users: new Set(),
@@ -738,272 +865,195 @@ app.post('/api/admin/add-room', (req, res) => {
     messages: [],
     status: 'show'
   });
-  
+  // 通知更新
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify({ type: 'room_list_update' }));
     }
   });
-  
   res.json({ success: true, message: '聊天室创建成功' });
 });
 
-// 重命名聊天室
-app.post('/api/admin/rename-room', (req, res) => {
-  const { oldName, newName } = req.body;
+// 编辑聊天室
+app.post('/api/admin/edit-room', adminAuth, (req, res) => {
+  const { oldName, newName, status } = req.body;
+  if (!oldName || !newName || !status) {
+    return res.json({ success: false, message: '参数不能为空' });
+  }
   if (!rooms.has(oldName)) {
-    return res.json({ success: false, message: '原房间不存在' });
+    return res.json({ success: false, message: '聊天室不存在' });
   }
-  if (rooms.has(newName)) {
-    return res.json({ success: false, message: '新房间名已存在' });
+  // 重命名
+  if (oldName !== newName && rooms.has(newName)) {
+    return res.json({ success: false, message: '新名称已存在' });
   }
-  
-  // 复制房间数据
   const roomData = rooms.get(oldName);
   rooms.delete(oldName);
-  rooms.set(newName, roomData);
-  
-  // 更新用户的房间信息
-  wss.clients.forEach(client => {
-    if (client.room === oldName) {
-      client.room = newName;
-    }
+  rooms.set(newName, {
+    ...roomData,
+    status
   });
-  
-  res.json({ success: true, message: '聊天室重命名成功' });
-});
-
-// 切换聊天室状态（显示/隐藏）
-app.post('/api/admin/toggle-room', (req, res) => {
-  const { name, status } = req.body;
-  if (!rooms.has(name)) {
-    return res.json({ success: false, message: '房间不存在' });
-  }
-  
-  const roomData = rooms.get(name);
-  roomData.status = status;
-  rooms.set(name, roomData);
-  
-  // 通知客户端更新房间列表
+  // 通知更新
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify({ type: 'room_list_update' }));
     }
   });
-  
-  res.json({ success: true, message: `聊天室已${status === 'show' ? '显示' : '隐藏'}` });
+  res.json({ success: true, message: '聊天室编辑成功' });
 });
 
 // 删除聊天室
-app.post('/api/admin/delete-room', (req, res) => {
+app.post('/api/admin/delete-room', adminAuth, (req, res) => {
   const { name } = req.body;
   if (!rooms.has(name)) {
-    return res.json({ success: false, message: '房间不存在' });
+    return res.json({ success: false, message: '聊天室不存在' });
   }
-  
-  // 通知房间内用户
+  // 通知用户
   broadcast(name, {
     type: 'room_dismissed',
     room: name,
     message: '房间已被管理员删除'
   });
-  
-  // 清空用户房间标识
-  wss.clients.forEach(client => {
-    if (client.room === name) {
-      client.room = '';
-    }
-  });
-  
+  // 移除房间
   rooms.delete(name);
-  
-  // 更新房间列表
+  // 通知更新
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify({ type: 'room_list_update' }));
     }
   });
-  
   res.json({ success: true, message: '聊天室删除成功' });
 });
 
-// 禁言/解除禁言用户
-app.post('/api/admin/mute-user', (req, res) => {
-  const { username, type, room } = req.body;
+// 获取所有用户
+app.get('/api/admin/users', adminAuth, (req, res) => {
+  const userList = [];
+  users.forEach((value, key) => {
+    userList.push({
+      username: key,
+      ip: value.ip,
+      muteRoom: value.muteRoom,
+      mutePrivate: value.mutePrivate,
+      loginTime: value.loginTime
+    });
+  });
+  res.json({ success: true, users: userList });
+});
+
+// 禁言用户
+app.post('/api/admin/mute-user', adminAuth, (req, res) => {
+  const { username, type } = req.body;
   if (!users.has(username)) {
     return res.json({ success: false, message: '用户不存在' });
   }
-  
   const user = users.get(username);
-  // 切换禁言状态
-  if (type === 'all') {
-    user.muted.all = !user.muted.all;
-  } else if (type === 'private') {
-    user.muted.private = !user.muted.private;
-  } else if (type === 'room' && room) {
-    const index = user.muted.room.indexOf(room);
-    if (index > -1) {
-      user.muted.room.splice(index, 1);
-    } else {
-      user.muted.room.push(room);
-    }
+  if (type === 'room' || type === 'all') {
+    user.muteRoom = true;
   }
-  
+  if (type === 'private' || type === 'all') {
+    user.mutePrivate = true;
+  }
   users.set(username, user);
-  
   // 通知用户
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === username) {
-      const action = (type === 'all' && user.muted.all) || 
-                     (type === 'private' && user.muted.private) || 
-                     (type === 'room' && user.muted.room.includes(room)) ? '禁言' : '解除禁言';
       client.send(JSON.stringify({
-        type: 'admin_mute',
-        message: `你已被管理员${action}(${type === 'room' ? '房间：'+room : type})`
+        type: 'global_mute',
+        status: {
+          room: user.muteRoom,
+          private: user.mutePrivate
+        }
       }));
     }
   });
-  
-  res.json({ success: true, message: `用户${user.muted.all || (type === 'private' && user.muted.private) || (type === 'room' && user.muted.room.includes(room)) ? '禁言' : '解除禁言'}成功` });
+  res.json({ success: true, message: '禁言成功' });
 });
 
-// 删除用户
-app.post('/api/admin/delete-user', (req, res) => {
-  const { username } = req.body;
+// 解除禁言
+app.post('/api/admin/unmute-user', adminAuth, (req, res) => {
+  const { username, type } = req.body;
   if (!users.has(username)) {
     return res.json({ success: false, message: '用户不存在' });
   }
-  
-  // 执行原有删除账号逻辑
-  users.delete(username);
-  friends.delete(username);
-  friends.forEach((friendSet) => {
-    friendSet.delete(username);
-  });
-  friendApplies.forEach((applies, to) => {
-    friendApplies.set(to, applies.filter(item => item.from !== username));
-  });
-  friendApplies.delete(username);
-  rooms.forEach((roomData, roomName) => {
-    roomData.users.delete(username);
-    roomData.muted.delete(username);
-  });
-  
-  // 断开用户连接
+  const user = users.get(username);
+  if (type === 'room' || type === 'all') {
+    user.muteRoom = false;
+  }
+  if (type === 'private' || type === 'all') {
+    user.mutePrivate = false;
+  }
+  users.set(username, user);
+  // 通知用户
   wss.clients.forEach(client => {
-    if (client.username === username) {
-      client.close();
+    if (client.readyState === WebSocket.OPEN && client.username === username) {
+      client.send(JSON.stringify({
+        type: 'global_mute',
+        status: {
+          room: user.muteRoom,
+          private: user.mutePrivate
+        }
+      }));
     }
   });
-  
-  res.json({ success: true, message: '用户删除成功' });
+  res.json({ success: true, message: '解除禁言成功' });
 });
 
-// 发送系统公告
-app.post('/api/admin/send-announcement', (req, res) => {
+// 获取消息记录
+app.get('/api/admin/msg-records', adminAuth, (req, res) => {
+  const { type, keywords } = req.query;
+  let records = allMessages;
+  // 筛选类型
+  if (type) {
+    records = records.filter(item => item.type === type);
+  }
+  // 筛选关键词
+  if (keywords) {
+    records = records.filter(item => item.content.includes(keywords));
+  }
+  res.json({ success: true, records });
+});
+
+// 发送公告
+app.post('/api/admin/send-notice', adminAuth, (req, res) => {
   const { content } = req.body;
   if (!content) {
     return res.json({ success: false, message: '公告内容不能为空' });
   }
-  
-  // 保存公告
-  announcements.push({
-    content,
-    time: new Date().toISOString()
-  });
-  
-  // 广播公告
-  broadcastAll({
-    type: 'system_announcement',
-    content,
-    time: new Date().toISOString()
-  });
-  
+  broadcastAdminNotice(content);
   res.json({ success: true, message: '公告发送成功' });
 });
 
 // 发送管理员消息
-app.post('/api/admin/send-msg', (req, res) => {
-  const { type, room, user, content } = req.body;
-  
-  if (type === 'room') {
-    // 发送到指定房间（带管理员标识）
-    broadcast(room, {
-      type: 'chat',
-      username: '[管理员]',
-      content,
-      room,
-      time: new Date().toISOString()
-    });
-    // 保存到房间记录
-    const roomData = rooms.get(room);
-    if (roomData) {
-      roomData.messages.push({
-        username: '[管理员]',
-        content,
-        time: new Date().toISOString()
-      });
-    }
-  } else if (type === 'private') {
-    // 发送私聊（带管理员标识）
-    sendPrivateMsg('[管理员]', user, content);
-  } else if (type === 'all') {
-    // 发送到所有在线用户
-    broadcastAll({
-      type: 'system',
-      content: `[管理员] ${content}`,
-      time: new Date().toISOString()
-    });
+app.post('/api/admin/send-msg', adminAuth, (req, res) => {
+  const { type, target, content } = req.body;
+  if (!content) {
+    return res.json({ success: false, message: '消息内容不能为空' });
   }
-  
+  sendAdminMsg(type, target, content);
   res.json({ success: true, message: '管理员消息发送成功' });
 });
 
 // 下载数据库
-app.get('/api/admin/download-db', (req, res) => {
-  // 转换Map为普通对象
+app.get('/api/admin/download-db', adminAuth, (req, res) => {
   const dbData = {
     users: Object.fromEntries(users),
-    rooms: Object.fromEntries(rooms),
-    friends: Object.fromEntries(friends),
-    privateMessages: Object.fromEntries(privateMessages),
-    announcements,
+    rooms: Object.fromEntries(Array.from(rooms.entries()).map(([k, v]) => [k, {
+      ...v,
+      users: Array.from(v.users),
+      muted: Array.from(v.muted)
+    }])),
+    friends: Object.fromEntries(Array.from(friends.entries()).map(([k, v]) => [k, Array.from(v)])),
     friendApplies: Object.fromEntries(friendApplies),
-    exportTime: new Date().toISOString()
+    privateMessages: Object.fromEntries(privateMessages),
+    allMessages
   };
-  
-  // 转换为JSON并下载
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition', `attachment; filename=chat-db-${Date.now()}.json`);
   res.send(JSON.stringify(dbData, null, 2));
-});
-
-// 备份数据库
-app.post('/api/admin/backup-db', (req, res) => {
-  const dbData = {
-    users: Object.fromEntries(users),
-    rooms: Object.fromEntries(rooms),
-    friends: Object.fromEntries(friends),
-    privateMessages: Object.fromEntries(privateMessages),
-    announcements,
-    friendApplies: Object.fromEntries(friendApplies),
-    backupTime: new Date().toISOString()
-  };
-  
-  const backupDir = path.join(__dirname, 'backups');
-  if (!fs.existsSync(backupDir)) {
-    fs.mkdirSync(backupDir);
-  }
-  
-  const backupPath = path.join(backupDir, `chat-backup-${Date.now()}.json`);
-  fs.writeFileSync(backupPath, JSON.stringify(dbData, null, 2));
-  
-  res.json({ success: true, message: '数据库备份成功', path: backupPath });
 });
 
 // 启动服务器
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`服务器运行在 http://localhost:${PORT}`);
-  console.log(`管理员后台地址: http://localhost:${PORT}/admin.html`);
 });

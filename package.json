@@ -1,33 +1,21 @@
 {
-  "name": "chat-room-server",
+  "name": "chat-server",
   "version": "1.0.0",
-  "description": "实时聊天室后端服务（支持房间创建、私聊、好友、权限管理）",
   "main": "app.js",
-  "scripts": {
-    "start": "node app.js",
-    "dev": "nodemon app.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
   "dependencies": {
     "express": "^4.18.2",
-    "ws": "^8.16.0",
-    "sqlite3": "^5.1.7",
+    "ws": "^8.14.2",
     "cors": "^2.8.5",
-    "body-parser": "^1.20.2"
+    "mysql2": "^3.6.5",
+    "bcryptjs": "^2.4.3",
+    "uuid": "^9.0.1",
+    "express-ws": "^5.0.2"
+  },
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js"
   },
   "devDependencies": {
-    "nodemon": "^3.0.3"
-  },
-  "keywords": [
-    "chat",
-    "websocket",
-    "express",
-    "sqlite3",
-    "realtime"
-  ],
-  "author": "",
-  "license": "MIT",
-  "engines": {
-    "node": ">=14.0.0"
+    "nodemon": "^3.0.2"
   }
 }

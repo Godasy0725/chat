@@ -2,11 +2,10 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const sqlite3 = require('sqlite3').verbose();
-const cors = require('cors');
+const cors = require('cors'); // 确保引入
 const bodyParser = require('body-parser');
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 
 // 初始化Express应用
 const app = express();
@@ -14,19 +13,19 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // 配置
-const PORT = process.env.PORT || 3000;
-const FRONTEND_DOMAIN = '*'; // 开发环境允许所有跨域，生产环境替换为实际域名
+const PORT = process.env.PORT || 3000; // 关键：读取Render的PORT环境变量
+const FRONTEND_DOMAIN = '*'; // Render部署时允许所有跨域
 const ADMIN_PASSWORD = 'Lmx%%112233';
 const DB_PATH = path.resolve(__dirname, './database.db');
 
-// 中间件
+// 中间件（确保cors正确使用）
 app.use(cors({
   origin: FRONTEND_DOMAIN,
   credentials: true
 }));
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
-app.use(express.static(__dirname)); // 托管静态文件（admin.html/index.html）
+app.use(express.static(__dirname)); // 托管静态文件
 
 // 存储在线用户IP
 const userIpMap = new Map(); // username => ip
@@ -580,9 +579,9 @@ function broadcastRoomList() {
   });
 }
 
-// 启动服务
-server.listen(PORT, () => {
-  console.log(`服务器运行在 http://localhost:${PORT}`);
-  console.log(`管理员后台: http://localhost:${PORT}/admin.html`);
-  console.log(`用户端: http://localhost:${PORT}/index.html`);
+// 启动服务（关键：绑定0.0.0.0）
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`服务器运行在 http://0.0.0.0:${PORT}`);
+  console.log(`管理员后台: http://0.0.0.0:${PORT}/admin.html`);
+  console.log(`用户端: http://0.0.0.0:${PORT}/index.html`);
 });

@@ -1206,16 +1206,51 @@ app.post('/api/admin/delete-message', adminAuth, (req, res) => {
   const { type, sender, target, time } = req.body;
   
   try {
-    // 查找并删除消息
-    const index = allMessages.findIndex(msg => {
+    let deleted = false;
+    
+    // 1. 从全局消息记录中删除
+    const globalIndex = allMessages.findIndex(msg => {
       return msg.sender === sender && 
              msg.target === target && 
              msg.time === time &&
              (msg.type === type || (type === 'room' && msg.type === 'room') || (type === 'private' && msg.type === 'private'));
     });
     
-    if (index !== -1) {
-      allMessages.splice(index, 1);
+    if (globalIndex !== -1) {
+      allMessages.splice(globalIndex, 1);
+      deleted = true;
+    }
+    
+    // 2. 从房间消息中删除（如果是聊天室消息）
+    if (type === 'room' && rooms.has(target)) {
+      const room = rooms.get(target);
+      const roomIndex = room.messages.findIndex(msg => {
+        return msg.username === sender && msg.time === time;
+      });
+      
+      if (roomIndex !== -1) {
+        room.messages.splice(roomIndex, 1);
+        deleted = true;
+      }
+    }
+    
+    // 3. 从私聊消息中删除（如果是私聊消息）
+    if (type === 'private') {
+      const key = getPrivateKey(sender, target);
+      if (privateMessages.has(key)) {
+        const privateMsgs = privateMessages.get(key);
+        const privateIndex = privateMsgs.findIndex(msg => {
+          return msg.sender === sender && msg.time === time;
+        });
+        
+        if (privateIndex !== -1) {
+          privateMsgs.splice(privateIndex, 1);
+          deleted = true;
+        }
+      }
+    }
+    
+    if (deleted) {
       res.json({ success: true, message: '消息删除成功' });
     } else {
       res.json({ success: false, message: '未找到该消息记录' });
@@ -1223,6 +1258,38 @@ app.post('/api/admin/delete-message', adminAuth, (req, res) => {
   } catch (error) {
     console.error('删除消息失败:', error);
     res.json({ success: false, message: '删除失败' });
+  }
+});
+
+// 清空历史消息记录
+app.post('/api/admin/clear-history', adminAuth, (req, res) => {
+  try {
+    // 1. 清空所有房间的消息记录
+    rooms.forEach((roomData, roomName) => {
+      roomData.messages = [];
+      
+      // 通知房间内用户消息已被清空
+      wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN && client.room === roomName) {
+          client.send(JSON.stringify({
+            type: 'system',
+            room: roomName,
+            content: '聊天记录已被管理员清空'
+          }));
+        }
+      });
+    });
+    
+    // 2. 清空所有私聊记录
+    privateMessages.clear();
+    
+    // 3. 清空全局消息记录
+    allMessages.length = 0;
+    
+    res.json({ success: true, message: '历史消息已清空' });
+  } catch (error) {
+    console.error('清空历史消息失败:', error);
+    res.json({ success: false, message: '清空失败' });
   }
 });
 

@@ -7,10 +7,30 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
+
+// Backblaze B2 配置
+const B2_CONFIG = {
+  keyId: '4327cfcd2993',
+  applicationKey: '003e1b6de560b99454c0b80af1b5ae7a362bbc8c1d',
+  endpoint: 'https://s3.eu-central-003.backblazeb2.com',
+  bucket: 'LMXCHAT'
+};
+
+// 初始化 S3 客户端（Backblaze B2 兼容 S3 API）
+const s3Client = new S3Client({
+  endpoint: B2_CONFIG.endpoint,
+  region: 'eu-central-003',
+  credentials: {
+    accessKeyId: B2_CONFIG.keyId,
+    secretAccessKey: B2_CONFIG.applicationKey
+  },
+  forcePathStyle: true
+});
 
 // 中间件
 app.use(cors());
@@ -69,9 +89,9 @@ const uploadFile = multer({
   }
 });
 
-// 静态文件服务
-app.use('/uploads', express.static(uploadsDir));
-app.use('/files', express.static(filesDir));
+// 静态文件服务（已改为 Backblaze B2 云存储）
+// app.use('/uploads', express.static(uploadsDir));
+// app.use('/files', express.static(filesDir));
 
 // 内存数据库（实际项目建议用MongoDB/MySQL）
 const users = new Map(); // { username: { password, avatar, ip, loginTime, muteRoom: false, mutePrivate: false, lastRenameDate: null } }
@@ -99,6 +119,43 @@ function getBJTime() {
 
 function getPrivateKey(user1, user2) {
   return [user1, user2].sort().join('-');
+}
+
+// 上传文件到 Backblaze B2
+async function uploadToB2(fileBuffer, fileName, contentType) {
+  const key = `files/${Date.now()}-${crypto.randomBytes(6).toString('hex')}-${fileName}`;
+  
+  const command = new PutObjectCommand({
+    Bucket: B2_CONFIG.bucket,
+    Key: key,
+    Body: fileBuffer,
+    ContentType: contentType
+  });
+  
+  await s3Client.send(command);
+  
+  // 返回文件访问URL
+  return `${B2_CONFIG.endpoint}/${B2_CONFIG.bucket}/${key}`;
+}
+
+// 从 Backblaze B2 删除文件
+async function deleteFromB2(fileUrl) {
+  try {
+    // 从 URL 中提取 key
+    const urlParts = fileUrl.split('/');
+    const key = urlParts.slice(4).join('/'); // 提取 files/xxx-xxx-filename
+    
+    const command = new DeleteObjectCommand({
+      Bucket: B2_CONFIG.bucket,
+      Key: key
+    });
+    
+    await s3Client.send(command);
+    return true;
+  } catch (error) {
+    console.error('删除文件失败:', error);
+    return false;
+  }
 }
 
 // 验证管理员Token
@@ -646,14 +703,27 @@ app.get('/api/history', (req, res) => {
 });
 
 // 上传图片
-app.post('/api/upload-image', upload.single('image'), (req, res) => {
+app.post('/api/upload-image', upload.single('image'), async (req, res) => {
   if (!req.file) {
     return res.json({ success: false, message: '请选择图片文件' });
   }
-  res.json({
-    success: true,
-    url: '/uploads/' + req.file.filename
-  });
+  
+  try {
+    // 读取文件并上传到 B2
+    const fileBuffer = fs.readFileSync(req.file.path);
+    const fileUrl = await uploadToB2(fileBuffer, req.file.originalname, req.file.mimetype);
+    
+    // 删除临时文件
+    fs.unlinkSync(req.file.path);
+    
+    res.json({
+      success: true,
+      url: fileUrl
+    });
+  } catch (error) {
+    console.error('图片上传失败:', error);
+    res.json({ success: false, message: '图片上传失败' });
+  }
 });
 
 // 添加好友
@@ -812,16 +882,29 @@ app.post('/api/send-private', (req, res) => {
 });
 
 // 上传文件
-app.post('/api/upload-file', uploadFile.single('file'), (req, res) => {
+app.post('/api/upload-file', uploadFile.single('file'), async (req, res) => {
   if (!req.file) {
     return res.json({ success: false, message: '请选择文件' });
   }
-  res.json({
-    success: true,
-    url: '/files/' + req.file.filename,
-    fileName: req.file.originalname,
-    fileSize: req.file.size
-  });
+  
+  try {
+    // 读取文件并上传到 B2
+    const fileBuffer = fs.readFileSync(req.file.path);
+    const fileUrl = await uploadToB2(fileBuffer, req.file.originalname, req.file.mimetype || 'application/octet-stream');
+    
+    // 删除临时文件
+    fs.unlinkSync(req.file.path);
+    
+    res.json({
+      success: true,
+      url: fileUrl,
+      fileName: req.file.originalname,
+      fileSize: req.file.size
+    });
+  } catch (error) {
+    console.error('文件上传失败:', error);
+    res.json({ success: false, message: '文件上传失败' });
+  }
 });
 
 // 获取私聊记录

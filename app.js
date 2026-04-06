@@ -22,13 +22,7 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// 创建 files 目录（用于存储非图片文件）
-const filesDir = path.join(__dirname, 'files');
-if (!fs.existsSync(filesDir)) {
-  fs.mkdirSync(filesDir, { recursive: true });
-}
-
-// 配置 multer（图片上传）
+// 配置 multer
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => {
@@ -50,36 +44,11 @@ const upload = multer({
   }
 });
 
-// 配置文件上传
-const fileStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, filesDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    const sanitizedName = file.originalname.replace(ext, '').replace(/[^a-zA-Z0-9\u4e00-\u9fa5_-]/g, '_');
-    cb(null, Date.now() + '-' + crypto.randomBytes(6).toString('hex') + '-' + sanitizedName + ext);
-  }
-});
-
-const uploadFile = multer({
-  storage: fileStorage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
-  fileFilter: (req, file, cb) => {
-    // 禁止可执行文件
-    const blocked = /\.(exe|bat|cmd|scr|pif|com|msi|dll|sh|bash|php|py|js|vbs|wsf)$/i;
-    if (blocked.test(path.extname(file.originalname))) {
-      cb(new Error('不支持发送可执行文件'));
-    } else {
-      cb(null, true);
-    }
-  }
-});
-
 // 静态文件服务
 app.use('/uploads', express.static(uploadsDir));
-app.use('/files', express.static(filesDir));
 
 // 内存数据库（实际项目建议用MongoDB/MySQL）
-const users = new Map(); // { username: { password, avatar, ip, loginTime, muteRoom: false, mutePrivate: false, lastRenameDate: null } }
+const users = new Map(); // { username: { password, avatar, ip, loginTime, muteRoom: false, mutePrivate: false } }
 const rooms = new Map(); // { roomName: { owner, users: Set, muted: Set, messages: Array, status: 'show/hide' } }
 const friendApplies = new Map(); // { to: [{ from, time }] }
 const friends = new Map(); // { user: Set(friends) }
@@ -179,7 +148,7 @@ function sendAdminMsg(type, target, content) {
 }
 
 // 发送私聊消息
-function sendPrivateMsg(sender, receiver, content, contentType = 'text', fileName = null, fileSize = null) {
+function sendPrivateMsg(sender, receiver, content, contentType = 'text') {
   // 检查发送方是否被私聊禁言
   const senderUser = users.get(sender);
   if (senderUser && senderUser.mutePrivate) {
@@ -203,9 +172,7 @@ function sendPrivateMsg(sender, receiver, content, contentType = 'text', fileNam
         sender,
         receiver,
         content,
-        contentType,
-        fileName,
-        fileSize
+        contentType
       }));
     }
   });
@@ -218,8 +185,6 @@ function sendPrivateMsg(sender, receiver, content, contentType = 'text', fileNam
     receiver,
     content,
     contentType,
-    fileName,
-    fileSize,
     time: getBJTime()
   };
   privateMessages.get(key).push(msgObj);
@@ -326,8 +291,6 @@ wss.on('connection', (ws, req) => {
           username: data.username,
           content: data.content,
           contentType: data.contentType || 'text',
-          fileName: data.fileName || null,
-          fileSize: data.fileSize || null,
           time: getBJTime()
         };
         room.messages.push(msgObj);
@@ -337,8 +300,6 @@ wss.on('connection', (ws, req) => {
           target: data.room,
           content: data.content,
           contentType: data.contentType || 'text',
-          fileName: data.fileName || null,
-          fileSize: data.fileSize || null,
           time: getBJTime(),
           type: 'room'
         });
@@ -352,7 +313,7 @@ wss.on('connection', (ws, req) => {
 
       // 发送私聊消息
       if (data.type === 'private_msg') {
-        sendPrivateMsg(data.sender, data.receiver, data.content, data.contentType || 'text', data.fileName || null, data.fileSize || null);
+        sendPrivateMsg(data.sender, data.receiver, data.content, data.contentType || 'text');
       }
 
     } catch (e) {
@@ -811,22 +772,9 @@ app.post('/api/delete-friend', (req, res) => {
 
 // 发送私聊消息（备用接口）
 app.post('/api/send-private', (req, res) => {
-  const { sender, receiver, content, contentType, fileName, fileSize } = req.body;
-  sendPrivateMsg(sender, receiver, content, contentType || 'text', fileName || null, fileSize || null);
+  const { sender, receiver, content } = req.body;
+  sendPrivateMsg(sender, receiver, content);
   res.json({ success: true, message: '消息发送成功' });
-});
-
-// 上传文件
-app.post('/api/upload-file', uploadFile.single('file'), (req, res) => {
-  if (!req.file) {
-    return res.json({ success: false, message: '请选择文件' });
-  }
-  res.json({
-    success: true,
-    url: '/files/' + req.file.filename,
-    fileName: req.file.originalname,
-    fileSize: req.file.size
-  });
 });
 
 // 获取私聊记录
@@ -843,16 +791,9 @@ app.post('/api/rename', (req, res) => {
   if (!users.has(oldName)) return res.json({ success: false, message: '用户不存在' });
   if (users.has(newName)) return res.json({ success: false, message: '昵称已被占用' });
   
-  // 检查每日改名限制
-  const userData = users.get(oldName);
-  const today = new Date().toDateString();
-  if (userData.lastRenameDate === today) {
-    return res.json({ success: false, message: '今日改名次数已达上限' });
-  }
-  
   // 更新用户名
+  const userData = users.get(oldName);
   users.delete(oldName);
-  userData.lastRenameDate = today;
   users.set(newName, userData);
   
   // 更新好友关系
@@ -865,6 +806,19 @@ app.post('/api/rename', (req, res) => {
   if (friends.has(oldName)) {
     friends.set(newName, friends.get(oldName));
     friends.delete(oldName);
+  }
+  
+  // 更新好友申请
+  friendApplies.forEach((applies, username) => {
+    applies.forEach(apply => {
+      if (apply.from === oldName) {
+        apply.from = newName;
+      }
+    });
+  });
+  if (friendApplies.has(oldName)) {
+    friendApplies.set(newName, friendApplies.get(oldName));
+    friendApplies.delete(oldName);
   }
   
   // 更新房间相关
@@ -882,22 +836,59 @@ app.post('/api/rename', (req, res) => {
     }
   });
   
-  // 通知客户端
+  // 更新私聊消息记录中的用户名
+  const privateMessageKeys = [];
+  privateMessages.forEach((messages, key) => {
+    if (key.includes(oldName)) {
+      privateMessageKeys.push(key);
+    }
+  });
+  
+  privateMessageKeys.forEach(oldKey => {
+    const messages = privateMessages.get(oldKey);
+    // 更新消息中的 sender 和 receiver
+    messages.forEach(msg => {
+      if (msg.sender === oldName) msg.sender = newName;
+      if (msg.receiver === oldName) msg.receiver = newName;
+    });
+    
+    // 更新 key
+    const otherUser = oldKey.split('-').find(u => u !== oldName);
+    const newKey = getPrivateKey(newName, otherUser);
+    privateMessages.delete(oldKey);
+    privateMessages.set(newKey, messages);
+  });
+  
+  // 更新全局消息记录中的用户名
+  allMessages.forEach(msg => {
+    if (msg.sender === oldName) msg.sender = newName;
+    if (msg.receiver === oldName) msg.receiver = newName;
+    if (msg.target === oldName) msg.target = newName;
+  });
+  
+  // 更新 WebSocket 客户端的用户名
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === oldName) {
       client.username = newName;
+    }
+  });
+  
+  // 通知改名用户自己
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.username === newName) {
       client.send(JSON.stringify({
         type: 'rename_success',
+        oldName,
         newName
       }));
     }
   });
   
-  // 广播改名消息给所有用户
+  // 广播给所有客户端，通知用户名已更改
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify({
-        type: 'rename',
+        type: 'user_renamed',
         oldName,
         newName
       }));

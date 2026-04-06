@@ -1355,6 +1355,93 @@ app.get('/api/admin/database-stats', adminAuth, (req, res) => {
   }
 });
 
+// 导入数据库
+app.post('/api/admin/import-db', adminAuth, (req, res) => {
+  try {
+    const dbData = req.body;
+    
+    // 验证数据格式
+    if (!dbData.users || !dbData.rooms || !dbData.allMessages) {
+      return res.json({ success: false, message: '数据格式不正确' });
+    }
+    
+    // 清空现有数据
+    users.clear();
+    rooms.clear();
+    friends.clear();
+    friendApplies.clear();
+    privateMessages.clear();
+    allMessages.length = 0;
+    
+    // 导入用户
+    if (dbData.users) {
+      Object.entries(dbData.users).forEach(([key, value]) => {
+        users.set(key, value);
+      });
+    }
+    
+    // 导入聊天室
+    if (dbData.rooms) {
+      Object.entries(dbData.rooms).forEach(([key, value]) => {
+        rooms.set(key, {
+          ...value,
+          users: new Set(value.users || []),
+          muted: new Set(value.muted || [])
+        });
+      });
+    }
+    
+    // 导入好友关系
+    if (dbData.friends) {
+      Object.entries(dbData.friends).forEach(([key, value]) => {
+        friends.set(key, new Set(value));
+      });
+    }
+    
+    // 导入好友申请
+    if (dbData.friendApplies) {
+      Object.entries(dbData.friendApplies).forEach(([key, value]) => {
+        friendApplies.set(key, value);
+      });
+    }
+    
+    // 导入私聊消息
+    if (dbData.privateMessages) {
+      Object.entries(dbData.privateMessages).forEach(([key, value]) => {
+        privateMessages.set(key, value);
+      });
+    }
+    
+    // 导入全局消息
+    if (dbData.allMessages) {
+      allMessages.push(...dbData.allMessages);
+    }
+    
+    // 通知所有客户端数据已更新
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({
+          type: 'database_imported',
+          message: '数据库已更新'
+        }));
+      }
+    });
+    
+    res.json({ 
+      success: true, 
+      message: '数据库导入成功',
+      stats: {
+        users: users.size,
+        rooms: rooms.size,
+        messages: allMessages.length
+      }
+    });
+  } catch (error) {
+    console.error('导入数据库失败:', error);
+    res.json({ success: false, message: '导入失败: ' + error.message });
+  }
+});
+
 // 启动服务器
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {

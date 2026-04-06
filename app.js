@@ -194,6 +194,22 @@ wss.on('connection', (ws, req) => {
 
       // 切换房间
       if (data.type === 'switch_room') {
+        // 先清理旧房间
+        if (ws.room && ws.room !== data.room && rooms.has(ws.room)) {
+          const oldRoom = rooms.get(ws.room);
+          oldRoom.users.delete(ws.username || data.username);
+          broadcast(ws.room, {
+            type: 'system',
+            room: ws.room,
+            content: `${ws.username || data.username} 离开房间`
+          });
+          broadcast(ws.room, {
+            type: 'online',
+            room: ws.room,
+            count: oldRoom.users.size
+          });
+        }
+
         ws.room = data.room;
         if (!rooms.has(data.room)) {
           ws.send(JSON.stringify({ type: 'error', message: '房间不存在' }));
@@ -363,6 +379,20 @@ app.get('/api/all-rooms', (req, res) => {
     });
   });
   res.json({ success: true, rooms: roomList });
+});
+
+// 获取房间用户列表
+app.get('/api/room-users', (req, res) => {
+  const { room } = req.query;
+  if (!room || !rooms.has(room)) {
+    return res.json({ success: false, message: '房间不存在' });
+  }
+  const r = rooms.get(room);
+  res.json({
+    success: true,
+    users: Array.from(r.users),
+    count: r.users.size
+  });
 });
 
 // 踢出用户

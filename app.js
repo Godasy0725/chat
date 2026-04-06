@@ -808,6 +808,19 @@ app.post('/api/rename', (req, res) => {
     friends.delete(oldName);
   }
   
+  // 更新好友申请
+  friendApplies.forEach((applies, username) => {
+    applies.forEach(apply => {
+      if (apply.from === oldName) {
+        apply.from = newName;
+      }
+    });
+  });
+  if (friendApplies.has(oldName)) {
+    friendApplies.set(newName, friendApplies.get(oldName));
+    friendApplies.delete(oldName);
+  }
+  
   // 更新房间相关
   rooms.forEach((roomData, roomName) => {
     if (roomData.owner === oldName) {
@@ -823,12 +836,60 @@ app.post('/api/rename', (req, res) => {
     }
   });
   
-  // 通知客户端
+  // 更新私聊消息记录中的用户名
+  const privateMessageKeys = [];
+  privateMessages.forEach((messages, key) => {
+    if (key.includes(oldName)) {
+      privateMessageKeys.push(key);
+    }
+  });
+  
+  privateMessageKeys.forEach(oldKey => {
+    const messages = privateMessages.get(oldKey);
+    // 更新消息中的 sender 和 receiver
+    messages.forEach(msg => {
+      if (msg.sender === oldName) msg.sender = newName;
+      if (msg.receiver === oldName) msg.receiver = newName;
+    });
+    
+    // 更新 key
+    const otherUser = oldKey.split('-').find(u => u !== oldName);
+    const newKey = getPrivateKey(newName, otherUser);
+    privateMessages.delete(oldKey);
+    privateMessages.set(newKey, messages);
+  });
+  
+  // 更新全局消息记录中的用户名
+  allMessages.forEach(msg => {
+    if (msg.sender === oldName) msg.sender = newName;
+    if (msg.receiver === oldName) msg.receiver = newName;
+    if (msg.target === oldName) msg.target = newName;
+  });
+  
+  // 更新 WebSocket 客户端的用户名
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === oldName) {
       client.username = newName;
+    }
+  });
+  
+  // 通知改名用户自己
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.username === newName) {
       client.send(JSON.stringify({
         type: 'rename_success',
+        oldName,
+        newName
+      }));
+    }
+  });
+  
+  // 广播给所有客户端，通知用户名已更改
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify({
+        type: 'user_renamed',
+        oldName,
         newName
       }));
     }

@@ -1201,6 +1201,93 @@ app.get('/api/admin/download-db', adminAuth, (req, res) => {
   res.send(JSON.stringify(dbData, null, 2));
 });
 
+// 删除消息
+app.post('/api/admin/delete-message', adminAuth, (req, res) => {
+  const { type, sender, target, time } = req.body;
+  
+  try {
+    // 查找并删除消息
+    const index = allMessages.findIndex(msg => {
+      return msg.sender === sender && 
+             msg.target === target && 
+             msg.time === time &&
+             (msg.type === type || (type === 'room' && msg.type === 'room') || (type === 'private' && msg.type === 'private'));
+    });
+    
+    if (index !== -1) {
+      allMessages.splice(index, 1);
+      res.json({ success: true, message: '消息删除成功' });
+    } else {
+      res.json({ success: false, message: '未找到该消息记录' });
+    }
+  } catch (error) {
+    console.error('删除消息失败:', error);
+    res.json({ success: false, message: '删除失败' });
+  }
+});
+
+// 清空数据库
+app.post('/api/admin/clear-database', adminAuth, (req, res) => {
+  try {
+    // 清空所有数据
+    users.clear();
+    rooms.clear();
+    friends.clear();
+    friendApplies.clear();
+    privateMessages.clear();
+    allMessages.length = 0;
+    
+    // 通知所有客户端
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({
+          type: 'database_cleared',
+          message: '数据库已被管理员清空'
+        }));
+      }
+    });
+    
+    res.json({ success: true, message: '数据库已清空' });
+  } catch (error) {
+    console.error('清空数据库失败:', error);
+    res.json({ success: false, message: '清空失败' });
+  }
+});
+
+// 获取数据库使用统计
+app.get('/api/admin/database-stats', adminAuth, (req, res) => {
+  try {
+    // 计算数据大小
+    const dbData = {
+      users: Object.fromEntries(users),
+      rooms: Object.fromEntries(Array.from(rooms.entries()).map(([k, v]) => [k, {
+        ...v,
+        users: Array.from(v.users),
+        muted: Array.from(v.muted)
+      }])),
+      friends: Object.fromEntries(Array.from(friends.entries()).map(([k, v]) => [k, Array.from(v)])),
+      friendApplies: Object.fromEntries(friendApplies),
+      privateMessages: Object.fromEntries(privateMessages),
+      allMessages
+    };
+    
+    const jsonString = JSON.stringify(dbData);
+    const bytes = new TextEncoder().encode(jsonString).length;
+    const sizeMB = (bytes / (1024 * 1024)).toFixed(2);
+    
+    res.json({
+      success: true,
+      sizeMB: sizeMB,
+      users: users.size,
+      rooms: rooms.size,
+      messages: allMessages.length
+    });
+  } catch (error) {
+    console.error('获取数据库统计失败:', error);
+    res.json({ success: false, message: '获取统计失败' });
+  }
+});
+
 // 启动服务器
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {

@@ -6,6 +6,7 @@ const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const multer = require('multer');
 
 const app = express();
 const server = http.createServer(app);
@@ -14,6 +15,37 @@ const wss = new WebSocket.Server({ server });
 // 中间件
 app.use(cors());
 app.use(bodyParser.json());
+
+// 创建 uploads 目录
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+// 配置 multer
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadsDir),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    cb(null, Date.now() + '-' + crypto.randomBytes(4).toString('hex') + ext);
+  }
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    const allowed = /\.(jpg|jpeg|png|gif|webp)$/i;
+    if (allowed.test(path.extname(file.originalname))) {
+      cb(null, true);
+    } else {
+      cb(new Error('不支持的图片格式'));
+    }
+  }
+});
+
+// 静态文件服务
+app.use('/uploads', express.static(uploadsDir));
 
 // 内存数据库（实际项目建议用MongoDB/MySQL）
 const users = new Map(); // { username: { password, avatar, ip, loginTime, muteRoom: false, mutePrivate: false } }
@@ -30,6 +62,13 @@ const ADMIN_TOKEN_EXPIRE = 24 * 60 * 60 * 1000; // 24小时过期
 // 工具函数
 function hashPassword(pwd) {
   return crypto.createHash('md5').update(pwd).digest('hex');
+}
+
+function getBJTime() {
+  const now = new Date();
+  const utc = now.getTime() + now.getTimezoneOffset() * 60000;
+  const bjTime = new Date(utc + 8 * 3600000);
+  return bjTime.toISOString().replace('Z', '+08:00');
 }
 
 function getPrivateKey(user1, user2) {
@@ -76,7 +115,7 @@ function sendAdminMsg(type, target, content) {
     type: 'admin_msg',
     target,
     content,
-    time: new Date().toISOString()
+    time: getBJTime()
   };
   
   if (type === 'all') {
@@ -103,13 +142,13 @@ function sendAdminMsg(type, target, content) {
     sender: '管理员',
     target,
     content,
-    time: new Date().toISOString(),
+    time: getBJTime(),
     type: 'admin'
   });
 }
 
 // 发送私聊消息
-function sendPrivateMsg(sender, receiver, content) {
+function sendPrivateMsg(sender, receiver, content, contentType = 'text') {
   // 检查发送方是否被私聊禁言
   const senderUser = users.get(sender);
   if (senderUser && senderUser.mutePrivate) {
@@ -132,7 +171,8 @@ function sendPrivateMsg(sender, receiver, content) {
         type: 'private_msg',
         sender,
         receiver,
-        content
+        content,
+        contentType
       }));
     }
   });
@@ -144,7 +184,8 @@ function sendPrivateMsg(sender, receiver, content) {
     sender,
     receiver,
     content,
-    time: new Date().toISOString()
+    contentType,
+    time: getBJTime()
   };
   privateMessages.get(key).push(msgObj);
   // 记录到全局消息
@@ -186,7 +227,7 @@ wss.on('connection', (ws, req) => {
           users.set(data.username, {
             ...users.get(data.username),
             ip,
-            loginTime: new Date().toISOString()
+            loginTime: getBJTime()
           });
         }
         ws.send(JSON.stringify({ type: 'login_success', username: data.username }));
@@ -249,7 +290,8 @@ wss.on('connection', (ws, req) => {
         const msgObj = {
           username: data.username,
           content: data.content,
-          time: new Date().toISOString()
+          contentType: data.contentType || 'text',
+          time: getBJTime()
         };
         room.messages.push(msgObj);
         // 记录到全局消息
@@ -257,7 +299,8 @@ wss.on('connection', (ws, req) => {
           sender: data.username,
           target: data.room,
           content: data.content,
-          time: new Date().toISOString(),
+          contentType: data.contentType || 'text',
+          time: getBJTime(),
           type: 'room'
         });
         
@@ -270,7 +313,7 @@ wss.on('connection', (ws, req) => {
 
       // 发送私聊消息
       if (data.type === 'private_msg') {
-        sendPrivateMsg(data.sender, data.receiver, data.content);
+        sendPrivateMsg(data.sender, data.receiver, data.content, data.contentType || 'text');
       }
 
     } catch (e) {
@@ -312,7 +355,7 @@ app.post('/api/register', (req, res) => {
     password: hashPassword(password),
     avatar: username.charAt(0).toUpperCase(),
     ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-    loginTime: new Date().toISOString(),
+    loginTime: getBJTime(),
     muteRoom: false,
     mutePrivate: false
   });
@@ -335,7 +378,7 @@ app.post('/api/login', (req, res) => {
   users.set(username, {
     ...user,
     ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-    loginTime: new Date().toISOString()
+    loginTime: getBJTime()
   });
   res.json({
     success: true,
@@ -568,6 +611,17 @@ app.get('/api/history', (req, res) => {
   });
 });
 
+// 上传图片
+app.post('/api/upload-image', upload.single('image'), (req, res) => {
+  if (!req.file) {
+    return res.json({ success: false, message: '请选择图片文件' });
+  }
+  res.json({
+    success: true,
+    url: '/uploads/' + req.file.filename
+  });
+});
+
 // 添加好友
 app.post('/api/add-friend', (req, res) => {
   const { from, to } = req.body;
@@ -587,7 +641,7 @@ app.post('/api/add-friend', (req, res) => {
     return res.json({ success: false, message: '已发送过申请' });
   }
   
-  applies.push({ from, time: new Date().toISOString() });
+  applies.push({ from, time: getBJTime() });
   
   // 通知被申请人
   wss.clients.forEach(client => {
@@ -847,7 +901,7 @@ app.get('/api/admin/dashboard', adminAuth, (req, res) => {
         username: client.username,
         ip: user?.ip || client._socket.remoteAddress,
         room: client.room || '',
-        loginTime: user?.loginTime || new Date().toISOString()
+        loginTime: user?.loginTime || getBJTime()
       });
     }
   });

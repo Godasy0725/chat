@@ -39,7 +39,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
   fileFilter: (req, file, cb) => {
     const allowed = /\.(jpg|jpeg|png|gif|webp)$/i;
     if (allowed.test(path.extname(file.originalname))) {
@@ -74,13 +74,14 @@ app.use('/uploads', express.static(uploadsDir));
 app.use('/files', express.static(filesDir));
 
 // 内存数据库（实际项目建议用MongoDB/MySQL）
-const users = new Map(); // { username: { password, avatar, ip, loginTime, muteRoom: false, mutePrivate: false, lastRenameDate: null } }
+const users = new Map(); // { username: { password, avatar, ip, loginTime, muteRoom: false, mutePrivate: false, lastRenameDate: null, hwid: null } }
 const rooms = new Map(); // { roomName: { owner, users: Set, muted: Set, messages: Array, status: 'show/hide' } }
 const friendApplies = new Map(); // { to: [{ from, time }] }
 const friends = new Map(); // { user: Set(friends) }
 const privateMessages = new Map(); // { "user1-user2": Array }
 const allMessages = []; // 所有消息记录（用于管理员查看）
 const roomUnread = new Map(); // { "username-roomName": count } 聊天室未读消息计数
+const hwidMuted = new Set(); // 被HWID禁言的硬件ID集合
 
 // 管理员配置
 const ADMIN_PASSWORD = 'Lmx%%112233';
@@ -100,6 +101,82 @@ function getBJTime() {
 
 function getPrivateKey(user1, user2) {
   return [user1, user2].sort().join('-');
+}
+
+// 计算数据库大小并自动清理
+function checkAndCleanDatabase() {
+  const MAX_SIZE_MB = 499;
+  const MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024;
+  
+  try {
+    // 计算当前数据库大小
+    const dbData = {
+      users: Object.fromEntries(users),
+      rooms: Object.fromEntries(Array.from(rooms.entries()).map(([k, v]) => [k, {
+        ...v,
+        users: Array.from(v.users),
+        muted: Array.from(v.muted)
+      }])),
+      friends: Object.fromEntries(Array.from(friends.entries()).map(([k, v]) => [k, Array.from(v)])),
+      friendApplies: Object.fromEntries(friendApplies),
+      privateMessages: Object.fromEntries(privateMessages),
+      roomUnread: Object.fromEntries(roomUnread),
+      allMessages
+    };
+    
+    const jsonString = JSON.stringify(dbData);
+    const currentSize = new TextEncoder().encode(jsonString).length;
+    
+    // 如果超过限制，删除最早的消息
+    if (currentSize > MAX_SIZE_BYTES) {
+      console.log(`数据库大小 ${((currentSize / (1024 * 1024)).toFixed(2))}MB 超过限制，开始清理...`);
+      
+      let deleted = false;
+      
+      // 1. 删除最早的全局消息
+      if (allMessages.length > 0) {
+        // 按时间排序，删除最早的10%消息
+        const deleteCount = Math.max(1, Math.floor(allMessages.length * 0.1));
+        allMessages.splice(0, deleteCount);
+        deleted = true;
+        console.log(`已删除 ${deleteCount} 条全局消息`);
+      }
+      
+      // 2. 删除每个房间最早的消息
+      rooms.forEach((roomData, roomName) => {
+        if (roomData.messages.length > 0) {
+          const deleteCount = Math.max(1, Math.floor(roomData.messages.length * 0.1));
+          roomData.messages.splice(0, deleteCount);
+          deleted = true;
+          console.log(`房间 ${roomName} 已删除 ${deleteCount} 条消息`);
+        }
+      });
+      
+      // 3. 删除最早的私聊消息
+      privateMessages.forEach((msgs, key) => {
+        if (msgs.length > 0) {
+          const deleteCount = Math.max(1, Math.floor(msgs.length * 0.1));
+          msgs.splice(0, deleteCount);
+          deleted = true;
+        }
+      });
+      
+      if (deleted) {
+        console.log('数据库清理完成');
+        // 通知所有在线用户
+        wss.clients.forEach(client => {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+              type: 'system',
+              content: '系统已自动清理部分历史消息以释放空间'
+            }));
+          }
+        });
+      }
+    }
+  } catch (error) {
+    console.error('数据库清理失败:', error);
+  }
 }
 
 // 验证管理员Token
@@ -191,6 +268,19 @@ function sendPrivateMsg(sender, receiver, content, contentType = 'text', fileNam
     return;
   }
   
+  // 检查消息长度限制（仅文本消息）
+  if (contentType === 'text' && content && content.length > 200) {
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN && client.username === sender) {
+        client.send(JSON.stringify({
+          type: 'error',
+          message: '消息长度不能超过200个字符'
+        }));
+      }
+    });
+    return;
+  }
+  
   // 推送消息给接收方
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === receiver) {
@@ -225,6 +315,9 @@ function sendPrivateMsg(sender, receiver, content, contentType = 'text', fileNam
     target: receiver,
     type: 'private'
   });
+  
+  // 检查数据库大小并自动清理
+  checkAndCleanDatabase();
 }
 
 // WebSocket连接
@@ -316,6 +409,15 @@ wss.on('connection', (ws, req) => {
           }));
           return;
         }
+        
+        // 检查消息长度限制（仅文本消息）
+        if (data.contentType === 'text' && data.content && data.content.length > 200) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: '消息长度不能超过200个字符'
+          }));
+          return;
+        }
 
         // 保存消息并广播
         const msgObj = {
@@ -338,6 +440,9 @@ wss.on('connection', (ws, req) => {
           time: getBJTime(),
           type: 'room'
         });
+        
+        // 检查数据库大小并自动清理
+        checkAndCleanDatabase();
         
         broadcast(data.room, {
           type: 'chat',
@@ -410,7 +515,7 @@ app.post('/api/register', (req, res) => {
 
 // 登录
 app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
+  const { username, password, hwid } = req.body;
   if (!users.has(username)) {
     return res.json({ success: false, message: '用户名不存在' });
   }
@@ -418,11 +523,18 @@ app.post('/api/login', (req, res) => {
   if (user.password !== hashPassword(password)) {
     return res.json({ success: false, message: '密码错误' });
   }
+  
+  // 检查HWID是否被禁言
+  if (hwid && hwidMuted.has(hwid)) {
+    return res.json({ success: false, message: '您的设备已被禁言，无法登录' });
+  }
+  
   // 更新登录信息
   users.set(username, {
     ...user,
     ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-    loginTime: getBJTime()
+    loginTime: getBJTime(),
+    hwid: hwid || user.hwid || null
   });
   res.json({
     success: true,
@@ -521,7 +633,7 @@ app.post('/api/kick', (req, res) => {
 
 // 禁言用户
 app.post('/api/mute', (req, res) => {
-  const { owner, room, username } = req.body;
+  const { owner, room, username, useHwid } = req.body;
   if (!rooms.has(room)) return res.json({ success: false, message: '房间不存在' });
   const roomData = rooms.get(room);
   
@@ -535,12 +647,20 @@ app.post('/api/mute', (req, res) => {
   
   roomData.muted.add(username);
   
+  // 如果使用HWID禁言
+  if (useHwid) {
+    const user = users.get(username);
+    if (user && user.hwid) {
+      hwidMuted.add(user.hwid);
+    }
+  }
+  
   // 通知被禁言用户
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.username === username) {
       client.send(JSON.stringify({
         type: 'room_muted',
-        message: '你已被群主禁言'
+        message: useHwid ? '你已被群主禁言（设备封禁）' : '你已被群主禁言'
       }));
     }
   });
@@ -548,10 +668,10 @@ app.post('/api/mute', (req, res) => {
   broadcast(room, {
     type: 'system',
     room,
-    content: `${username} 被禁言`
+    content: `${username} 被禁言${useHwid ? '（设备封禁）' : ''}`
   });
   
-  res.json({ success: true, message: '禁言成功' });
+  res.json({ success: true, message: useHwid ? '禁言成功（设备封禁）' : '禁言成功' });
 });
 
 // 解除禁言
@@ -587,6 +707,94 @@ app.post('/api/unmute', (req, res) => {
   });
   
   res.json({ success: true, message: '解除禁言成功' });
+});
+
+// 撤回消息
+app.post('/api/recall-message', (req, res) => {
+  const { username, room, time, type, receiver } = req.body;
+  
+  try {
+    let deleted = false;
+    
+    if (type === 'room') {
+      // 撤回聊天室消息
+      if (!rooms.has(room)) {
+        return res.json({ success: false, message: '房间不存在' });
+      }
+      
+      const roomData = rooms.get(room);
+      const msgIndex = roomData.messages.findIndex(msg => {
+        return msg.username === username && msg.time === time;
+      });
+      
+      if (msgIndex !== -1) {
+        roomData.messages.splice(msgIndex, 1);
+        deleted = true;
+        
+        // 从全局消息中删除
+        const globalIndex = allMessages.findIndex(msg => {
+          return msg.sender === username && msg.target === room && msg.time === time && msg.type === 'room';
+        });
+        
+        if (globalIndex !== -1) {
+          allMessages.splice(globalIndex, 1);
+        }
+        
+        // 通知房间内用户
+        broadcast(room, {
+          type: 'message_recalled',
+          room,
+          time,
+          username
+        });
+      }
+    } else if (type === 'private') {
+      // 撤回私聊消息
+      const key = getPrivateKey(username, receiver);
+      
+      if (privateMessages.has(key)) {
+        const msgs = privateMessages.get(key);
+        const msgIndex = msgs.findIndex(msg => {
+          return msg.sender === username && msg.time === time;
+        });
+        
+        if (msgIndex !== -1) {
+          msgs.splice(msgIndex, 1);
+          deleted = true;
+          
+          // 从全局消息中删除
+          const globalIndex = allMessages.findIndex(msg => {
+            return msg.sender === username && msg.target === receiver && msg.time === time && msg.type === 'private';
+          });
+          
+          if (globalIndex !== -1) {
+            allMessages.splice(globalIndex, 1);
+          }
+          
+          // 通知对方
+          wss.clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN && client.username === receiver) {
+              client.send(JSON.stringify({
+                type: 'message_recalled',
+                sender: username,
+                receiver,
+                time
+              }));
+            }
+          });
+        }
+      }
+    }
+    
+    if (deleted) {
+      res.json({ success: true, message: '消息已撤回' });
+    } else {
+      res.json({ success: false, message: '消息不存在或已被删除' });
+    }
+  } catch (error) {
+    console.error('撤回消息失败:', error);
+    res.json({ success: false, message: '撤回失败' });
+  }
 });
 
 // 清空房间消息
@@ -1234,6 +1442,7 @@ app.get('/api/admin/download-db', adminAuth, (req, res) => {
     friendApplies: Object.fromEntries(friendApplies),
     privateMessages: Object.fromEntries(privateMessages),
     roomUnread: Object.fromEntries(roomUnread),
+    hwidMuted: Array.from(hwidMuted),
     allMessages
   };
   res.setHeader('Content-Type', 'application/json');
@@ -1343,6 +1552,7 @@ app.post('/api/admin/clear-database', adminAuth, (req, res) => {
     friendApplies.clear();
     privateMessages.clear();
     roomUnread.clear();
+    hwidMuted.clear();
     allMessages.length = 0;
     
     // 通知所有客户端
@@ -1377,6 +1587,7 @@ app.get('/api/admin/database-stats', adminAuth, (req, res) => {
       friendApplies: Object.fromEntries(friendApplies),
       privateMessages: Object.fromEntries(privateMessages),
       roomUnread: Object.fromEntries(roomUnread),
+      hwidMuted: Array.from(hwidMuted),
       allMessages
     };
     
@@ -1414,6 +1625,7 @@ app.post('/api/admin/import-db', adminAuth, (req, res) => {
     friendApplies.clear();
     privateMessages.clear();
     roomUnread.clear();
+    hwidMuted.clear();
     allMessages.length = 0;
     
     // 导入用户
@@ -1459,6 +1671,13 @@ app.post('/api/admin/import-db', adminAuth, (req, res) => {
     if (dbData.roomUnread) {
       Object.entries(dbData.roomUnread).forEach(([key, value]) => {
         roomUnread.set(key, value);
+      });
+    }
+    
+    // 导入HWID禁言列表
+    if (dbData.hwidMuted) {
+      dbData.hwidMuted.forEach(hwid => {
+        hwidMuted.add(hwid);
       });
     }
     

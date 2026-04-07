@@ -80,6 +80,7 @@ const friendApplies = new Map(); // { to: [{ from, time }] }
 const friends = new Map(); // { user: Set(friends) }
 const privateMessages = new Map(); // { "user1-user2": Array }
 const allMessages = []; // 所有消息记录（用于管理员查看）
+const roomUnread = new Map(); // { "username-roomName": count } 聊天室未读消息计数
 
 // 管理员配置
 const ADMIN_PASSWORD = 'Lmx%%112233';
@@ -342,6 +343,15 @@ wss.on('connection', (ws, req) => {
           type: 'chat',
           room: data.room,
           ...msgObj
+        });
+        
+        // 为不在该房间的所有在线用户增加未读计数
+        const unreadKey = `${data.username}-${data.room}`;
+        wss.clients.forEach(client => {
+          if (client.readyState === WebSocket.OPEN && client.username && client.room !== data.room) {
+            const key = `${client.username}-${data.room}`;
+            roomUnread.set(key, (roomUnread.get(key) || 0) + 1);
+          }
         });
       }
 
@@ -643,6 +653,35 @@ app.get('/api/history', (req, res) => {
     success: true,
     list: rooms.get(room).messages
   });
+});
+
+// 获取用户聊天室未读消息计数
+app.get('/api/room-unread', (req, res) => {
+  const { username } = req.query;
+  if (!username) return res.json({ success: false, message: '用户名不能为空' });
+  
+  const unreadData = {};
+  roomUnread.forEach((count, key) => {
+    const [user, room] = key.split('-');
+    if (user === username && count > 0) {
+      unreadData[room] = count;
+    }
+  });
+  
+  res.json({ success: true, unread: unreadData });
+});
+
+// 清除聊天室未读消息计数
+app.post('/api/clear-room-unread', (req, res) => {
+  const { username, room } = req.body;
+  if (!username || !room) {
+    return res.json({ success: false, message: '参数不完整' });
+  }
+  
+  const key = `${username}-${room}`;
+  roomUnread.delete(key);
+  
+  res.json({ success: true, message: '未读消息已清除' });
 });
 
 // 上传图片
@@ -1194,6 +1233,7 @@ app.get('/api/admin/download-db', adminAuth, (req, res) => {
     friends: Object.fromEntries(Array.from(friends.entries()).map(([k, v]) => [k, Array.from(v)])),
     friendApplies: Object.fromEntries(friendApplies),
     privateMessages: Object.fromEntries(privateMessages),
+    roomUnread: Object.fromEntries(roomUnread),
     allMessages
   };
   res.setHeader('Content-Type', 'application/json');
@@ -1302,6 +1342,7 @@ app.post('/api/admin/clear-database', adminAuth, (req, res) => {
     friends.clear();
     friendApplies.clear();
     privateMessages.clear();
+    roomUnread.clear();
     allMessages.length = 0;
     
     // 通知所有客户端
@@ -1335,6 +1376,7 @@ app.get('/api/admin/database-stats', adminAuth, (req, res) => {
       friends: Object.fromEntries(Array.from(friends.entries()).map(([k, v]) => [k, Array.from(v)])),
       friendApplies: Object.fromEntries(friendApplies),
       privateMessages: Object.fromEntries(privateMessages),
+      roomUnread: Object.fromEntries(roomUnread),
       allMessages
     };
     
@@ -1371,6 +1413,7 @@ app.post('/api/admin/import-db', adminAuth, (req, res) => {
     friends.clear();
     friendApplies.clear();
     privateMessages.clear();
+    roomUnread.clear();
     allMessages.length = 0;
     
     // 导入用户
@@ -1409,6 +1452,13 @@ app.post('/api/admin/import-db', adminAuth, (req, res) => {
     if (dbData.privateMessages) {
       Object.entries(dbData.privateMessages).forEach(([key, value]) => {
         privateMessages.set(key, value);
+      });
+    }
+    
+    // 导入聊天室未读消息
+    if (dbData.roomUnread) {
+      Object.entries(dbData.roomUnread).forEach(([key, value]) => {
+        roomUnread.set(key, value);
       });
     }
     

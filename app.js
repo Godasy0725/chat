@@ -380,7 +380,20 @@ wss.on('connection', (ws, req) => {
           ws.send(JSON.stringify({ type: 'error', message: '房间不存在' }));
           return;
         }
+        
         const room = rooms.get(data.room);
+        
+        // 检查白名单
+        if (room.whitelistEnabled && room.whitelist) {
+          if (!room.whitelist.has(data.username)) {
+            ws.send(JSON.stringify({ 
+              type: 'error', 
+              message: '您不在该房间的白名单中，无法进入' 
+            }));
+            return;
+          }
+        }
+        
         room.users.add(data.username);
         broadcast(data.room, {
           type: 'system',
@@ -890,6 +903,132 @@ app.post('/api/clear-room-unread', (req, res) => {
   roomUnread.delete(key);
   
   res.json({ success: true, message: '未读消息已清除' });
+});
+
+// ===== 房间管理 API =====
+
+// 设置房间密码
+app.post('/api/set-room-password', (req, res) => {
+  const { owner, room, password } = req.body;
+  if (!rooms.has(room)) {
+    return res.json({ success: false, message: '房间不存在' });
+  }
+  
+  const roomData = rooms.get(room);
+  if (roomData.owner !== owner) {
+    return res.json({ success: false, message: '只有群主可以设置密码' });
+  }
+  
+  if (password) {
+    roomData.password = hashPassword(password);
+  } else {
+    delete roomData.password;
+  }
+  
+  rooms.set(room, roomData);
+  res.json({ success: true, message: password ? '密码设置成功' : '密码已移除' });
+});
+
+// 验证房间密码
+app.post('/api/verify-room-password', (req, res) => {
+  const { room, password } = req.body;
+  if (!rooms.has(room)) {
+    return res.json({ success: false, message: '房间不存在' });
+  }
+  
+  const roomData = rooms.get(room);
+  if (!roomData.password) {
+    return res.json({ success: true, message: '房间未设置密码' });
+  }
+  
+  if (roomData.password === hashPassword(password)) {
+    res.json({ success: true, message: '密码验证成功' });
+  } else {
+    res.json({ success: false, message: '密码错误' });
+  }
+});
+
+// 切换白名单模式
+app.post('/api/toggle-whitelist', (req, res) => {
+  const { owner, room, enabled } = req.body;
+  if (!rooms.has(room)) {
+    return res.json({ success: false, message: '房间不存在' });
+  }
+  
+  const roomData = rooms.get(room);
+  if (roomData.owner !== owner) {
+    return res.json({ success: false, message: '只有群主可以切换白名单模式' });
+  }
+  
+  roomData.whitelistEnabled = enabled;
+  if (!roomData.whitelist) {
+    roomData.whitelist = new Set();
+  }
+  
+  rooms.set(room, roomData);
+  res.json({ success: true, message: enabled ? '白名单模式已开启' : '白名单模式已关闭' });
+});
+
+// 添加到白名单
+app.post('/api/add-to-whitelist', (req, res) => {
+  const { owner, room, user } = req.body;
+  if (!rooms.has(room)) {
+    return res.json({ success: false, message: '房间不存在' });
+  }
+  
+  const roomData = rooms.get(room);
+  if (roomData.owner !== owner) {
+    return res.json({ success: false, message: '只有群主可以管理白名单' });
+  }
+  
+  if (!roomData.whitelist) {
+    roomData.whitelist = new Set();
+  }
+  
+  roomData.whitelist.add(user);
+  rooms.set(room, roomData);
+  res.json({ success: true, message: '已添加到白名单' });
+});
+
+// 从白名单移除
+app.post('/api/remove-from-whitelist', (req, res) => {
+  const { owner, room, user } = req.body;
+  if (!rooms.has(room)) {
+    return res.json({ success: false, message: '房间不存在' });
+  }
+  
+  const roomData = rooms.get(room);
+  if (roomData.owner !== owner) {
+    return res.json({ success: false, message: '只有群主可以管理白名单' });
+  }
+  
+  if (roomData.whitelist) {
+    roomData.whitelist.delete(user);
+    rooms.set(room, roomData);
+  }
+  
+  res.json({ success: true, message: '已从白名单移除' });
+});
+
+// 获取房间信息（包括禁言列表、白名单等）
+app.get('/api/room-info', (req, res) => {
+  const { room } = req.query;
+  if (!rooms.has(room)) {
+    return res.json({ success: false, message: '房间不存在' });
+  }
+  
+  const roomData = rooms.get(room);
+  const info = {
+    success: true,
+    room: room,
+    owner: roomData.owner,
+    hasPassword: !!roomData.password,
+    whitelistEnabled: roomData.whitelistEnabled || false,
+    whitelist: roomData.whitelist ? Array.from(roomData.whitelist) : [],
+    muted: roomData.muted ? Array.from(roomData.muted) : []
+  };
+  
+  res.json(info);
 });
 
 // 上传图片

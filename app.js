@@ -16,6 +16,33 @@ const wss = new WebSocket.Server({ server });
 app.use(cors());
 app.use(bodyParser.json());
 
+// 健康检查接口 (Health Check) - 修复 Render 平台健康检测
+app.get('/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    version: '1.0.0'
+  });
+});
+
+// 同时兼容根路径访问，避免出现 "Cannot GET /" 错误
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Chat Server</title>
+        <style>body { font-family: Arial; text-align: center; padding-top: 50px; }</style>
+      </head>
+      <body>
+        <h1>Chat Server is Running</h1>
+        <p>服务器已启动，健康状态：正常</p>
+        <p><a href="/health">健康检查接口</a></p>
+      </body>
+    </html>
+  `);
+});
+
 // 创建 uploads 目录
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) {

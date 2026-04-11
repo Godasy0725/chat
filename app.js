@@ -16,33 +16,6 @@ const wss = new WebSocket.Server({ server });
 app.use(cors());
 app.use(bodyParser.json());
 
-// 健康检查接口 (Health Check) - 修复 Render 平台健康检测
-app.get('/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    version: '1.0.0'
-  });
-});
-
-// 同时兼容根路径访问，避免出现 "Cannot GET /" 错误
-app.get('/', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <title>Chat Server</title>
-        <style>body { font-family: Arial; text-align: center; padding-top: 50px; }</style>
-      </head>
-      <body>
-        <h1>Chat Server is Running</h1>
-        <p>服务器已启动，健康状态：正常</p>
-        <p><a href="/health">健康检查接口</a></p>
-      </body>
-    </html>
-  `);
-});
-
 // 创建 uploads 目录
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) {
@@ -101,7 +74,7 @@ app.use('/uploads', express.static(uploadsDir));
 app.use('/files', express.static(filesDir));
 
 // 内存数据库（实际项目建议用MongoDB/MySQL）
-const users = new Map(); // { username: { password, avatar, ip, loginTime, muteRoom: false, mutePrivate: false, lastRenameDate: null, hwid: null } }
+const users = new Map(); // { username: { password, avatar, ips: [], loginTime, muteRoom: false, mutePrivate: false, lastRenameDate: null, hwid: null, banned: false } }
 const rooms = new Map(); // { roomName: { owner, users: Set, muted: Set, messages: Array, status: 'show/hide' } }
 const friendApplies = new Map(); // { to: [{ from, time }] }
 const friends = new Map(); // { user: Set(friends) }
@@ -109,6 +82,9 @@ const privateMessages = new Map(); // { "user1-user2": Array }
 const allMessages = []; // 所有消息记录（用于管理员查看）
 const roomUnread = new Map(); // { "username-roomName": count } 聊天室未读消息计数
 const hwidMuted = new Set(); // 被HWID禁言的硬件ID集合
+const bannedIPs = new Set(); // 被封禁的IP地址集合
+const bannedHWIDs = new Set(); // 被封禁的HWID集合
+const bannedUsers = new Set(); // 被封禁的用户名集合
 
 // 管理员配置
 const ADMIN_PASSWORD = 'Lmx%%112233';
@@ -138,7 +114,10 @@ function checkAndCleanDatabase() {
   try {
     // 计算当前数据库大小
     const dbData = {
-      users: Object.fromEntries(users),
+      users: Object.fromEntries(Array.from(users.entries()).map(([k, v]) => [k, {
+        ...v,
+        ips: v.ips || []
+      }])),
       rooms: Object.fromEntries(Array.from(rooms.entries()).map(([k, v]) => [k, {
         ...v,
         users: Array.from(v.users),
@@ -148,6 +127,9 @@ function checkAndCleanDatabase() {
       friendApplies: Object.fromEntries(friendApplies),
       privateMessages: Object.fromEntries(privateMessages),
       roomUnread: Object.fromEntries(roomUnread),
+      bannedIPs: Array.from(bannedIPs),
+      bannedHWIDs: Array.from(bannedHWIDs),
+      bannedUsers: Array.from(bannedUsers),
       allMessages
     };
     
@@ -560,6 +542,24 @@ app.post('/api/login', (req, res) => {
     return res.json({ success: false, message: '用户名不存在' });
   }
   const user = users.get(username);
+  
+  // 检查用户是否被封禁
+  if (user.banned || bannedUsers.has(username)) {
+    return res.json({ success: false, message: '您的账号已被封禁' });
+  }
+  
+  // 检查HWID是否被封禁
+  if (hwid && bannedHWIDs.has(hwid)) {
+    return res.json({ success: false, message: '您的设备已被封禁' });
+  }
+  
+  const currentIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  
+  // 检查IP是否被封禁
+  if (bannedIPs.has(currentIP)) {
+    return res.json({ success: false, message: '您的IP地址已被封禁' });
+  }
+  
   if (user.password !== hashPassword(password)) {
     return res.json({ success: false, message: '密码错误' });
   }
@@ -569,16 +569,29 @@ app.post('/api/login', (req, res) => {
     return res.json({ success: false, message: '您的设备已被禁言，无法登录' });
   }
   
-  // 更新登录信息
+  // 更新登录信息，记录历史IP
+  if (!user.ips) {
+    user.ips = [];
+  }
+  
+  // 添加新IP（如果不存在）
+  if (!user.ips.includes(currentIP)) {
+    user.ips.push(currentIP);
+  }
+  
   users.set(username, {
     ...user,
-    ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
     loginTime: getBJTime(),
     hwid: hwid || user.hwid || null
   });
+  
   res.json({
     success: true,
-    data: { username, avatar: user.avatar }
+    data: { 
+      username, 
+      avatar: user.avatar,
+      ips: user.ips || []  // 返回所有历史IP
+    }
   });
 });
 
@@ -1560,6 +1573,64 @@ app.post('/api/admin/unmute-user', adminAuth, (req, res) => {
   res.json({ success: true, message: '解除禁言成功' });
 });
 
+// 封禁用户
+app.post('/api/admin/ban-user', adminAuth, (req, res) => {
+  const { username } = req.body;
+  if (!users.has(username)) {
+    return res.json({ success: false, message: '用户不存在' });
+  }
+  
+  const user = users.get(username);
+  user.banned = true;
+  users.set(username, user);
+  bannedUsers.add(username);
+  
+  // 封禁所有历史IP
+  if (user.ips && user.ips.length > 0) {
+    user.ips.forEach(ip => bannedIPs.add(ip));
+  }
+  
+  // 封禁HWID
+  if (user.hwid) {
+    bannedHWIDs.add(user.hwid);
+  }
+  
+  // 踢出在线用户
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.username === username) {
+      client.send(JSON.stringify({ type: 'banned', message: '您的账号已被管理员封禁' }));
+      client.close();
+    }
+  });
+  
+  res.json({ success: true, message: `用户 ${username} 已被封禁` });
+});
+
+// 解封用户
+app.post('/api/admin/unban-user', adminAuth, (req, res) => {
+  const { username } = req.body;
+  if (!users.has(username)) {
+    return res.json({ success: false, message: '用户不存在' });
+  }
+  
+  const user = users.get(username);
+  user.banned = false;
+  users.set(username, user);
+  bannedUsers.delete(username);
+  
+  res.json({ success: true, message: `用户 ${username} 已被解封` });
+});
+
+// 获取封禁列表
+app.get('/api/admin/ban-list', adminAuth, (req, res) => {
+  const banList = {
+    users: Array.from(bannedUsers),
+    ips: Array.from(bannedIPs),
+    hwids: Array.from(bannedHWIDs)
+  };
+  res.json({ success: true, banList });
+});
+
 // 获取消息记录
 app.get('/api/admin/msg-records', adminAuth, (req, res) => {
   const { type, keywords } = req.query;
@@ -1598,7 +1669,10 @@ app.post('/api/admin/send-msg', adminAuth, (req, res) => {
 // 下载数据库
 app.get('/api/admin/download-db', adminAuth, (req, res) => {
   const dbData = {
-    users: Object.fromEntries(users),
+    users: Object.fromEntries(Array.from(users.entries()).map(([k, v]) => [k, {
+      ...v,
+      ips: v.ips || []
+    }])),
     rooms: Object.fromEntries(Array.from(rooms.entries()).map(([k, v]) => [k, {
       ...v,
       users: Array.from(v.users),
@@ -1609,6 +1683,9 @@ app.get('/api/admin/download-db', adminAuth, (req, res) => {
     privateMessages: Object.fromEntries(privateMessages),
     roomUnread: Object.fromEntries(roomUnread),
     hwidMuted: Array.from(hwidMuted),
+    bannedIPs: Array.from(bannedIPs),
+    bannedHWIDs: Array.from(bannedHWIDs),
+    bannedUsers: Array.from(bannedUsers),
     allMessages
   };
   res.setHeader('Content-Type', 'application/json');
